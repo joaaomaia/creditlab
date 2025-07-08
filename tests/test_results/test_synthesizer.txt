@@ -1,0 +1,24 @@
+============================= test session starts =============================
+platform win32 -- Python 3.11.5, pytest-7.4.0, pluggy-1.0.0 -- C:\Users\JM\AppData\Local\anaconda3\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\JM\Documents\0_CienciaDados\1_Frameworks\creditlab
+plugins: anyio-3.5.0
+collecting ... collected 5 items
+
+tests/test_synthesizer.py::test_snapshot_size PASSED                     [ 20%]
+tests/test_synthesizer.py::test_panel_safras_count PASSED                [ 40%]
+tests/test_synthesizer.py::test_unique_ids PASSED                        [ 60%]
+tests/test_synthesizer.py::test_features_presence PASSED                 [ 80%]
+tests/test_synthesizer.py::test_targets_flagged PASSED                   [100%]
+
+============================== warnings summary ===============================
+tests/test_synthesizer.py: 165 warnings
+  C:\Users\JM\Documents\0_CienciaDados\1_Frameworks\creditlab\credit_data_synthesizer.py:277: SettingWithCopyWarning: 
+  A value is trying to be set on a copy of a slice from a DataFrame.
+  Try using .loc[row_indexer,col_indexer] = value instead
+  
+  See the caveats in the documentation: https://pandas.pydata.org/pandas-docs/stable/user_guide/indexing.html#returning-a-view-versus-a-copy
+    sub["dias_atraso"] = new_delay
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================= 5 passed, 165 warnings in 4.79s =======================
