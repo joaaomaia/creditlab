@@ -176,12 +176,26 @@ class CreditDataSynthesizer:
         n_safras: int = 24,
         random_seed: int = 42,
         kernel_trick: bool = True,
+        start_safra: str | pd.Timestamp | int | None = None,
     ) -> None:
         self.group_profiles = group_profiles
         self.contracts_per_group = contracts_per_group
         self.n_safras = n_safras
         self.kernel_trick = kernel_trick
         self.rng = np.random.default_rng(random_seed)
+
+        if start_safra is None:
+            self.start_safra = pd.Timestamp("today").normalize().replace(day=1)
+        else:
+            if isinstance(start_safra, int):
+                start_safra = str(start_safra)
+            if isinstance(start_safra, str):
+                self.start_safra = pd.to_datetime(start_safra, format="%Y%m")
+            elif isinstance(start_safra, pd.Timestamp):
+                self.start_safra = start_safra
+            else:
+                raise TypeError("start_safra must be str, int, Timestamp or None")
+            self.start_safra = self.start_safra.normalize().replace(day=1)
 
         # DataFrames de saída
         self._snapshot: pd.DataFrame | None = None
@@ -210,7 +224,7 @@ class CreditDataSynthesizer:
     # ------------------------------------------------------------------
     def _generate_snapshot(self) -> None:
         records: List[pd.DataFrame] = []
-        start_date = pd.Timestamp("today").normalize()
+        start_date = self.start_safra
         for g_idx, gp in enumerate(self.group_profiles):
             offset = g_idx * self.contracts_per_group
             df = gp.sample_contracts(
