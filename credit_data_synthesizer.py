@@ -12,6 +12,13 @@ Principais recursos
   3. **trace** com o rastro de renegociações (id_antigo → id_novo).
 * Gera +10 features relevantes além das já existentes.
 * Inclui kernel‑stratificação (quantis) e possibilita choque macroeconômico.
+
+Exemplo de uso com buckets personalizados::
+
+    synth = CreditDataSynthesizer(
+        group_profiles=default_group_profiles(4),
+        buckets=[0,15,30,60,90,120,180,240,360],
+    )
 """
 
 from __future__ import annotations
@@ -20,6 +27,8 @@ from dataclasses import dataclass
 from typing import List, Tuple
 import numpy as np
 import pandas as pd
+
+DEFAULT_BUCKETS = [0, 15, 30, 60, 90]
 
 import warnings
 warnings.simplefilter(action='ignore', category=pd.errors.SettingWithCopyWarning)
@@ -36,38 +45,27 @@ class GroupProfile:
     pd_base: float  # PD 12m baseline (pior grupo ≈ 0.12, melhor ≈ 0.02)
     refin_prob: float  # probabilidade de aceitar refinanciamento quando elegível
     reneg_prob_exog: float  # prob mensal de renegociação exógena (fora trigger 90d)
-    transition_matrix: np.ndarray | None = None  # shape (5,5) [0,15,30,60,90]
+    transition_matrix: np.ndarray | None = None  # matriz de transição
 
     def __post_init__(self) -> None:
         if self.transition_matrix is None:
-            base = np.array([
-                [0.80, 0.15, 0.04, 0.01, 0.00],
-                [0.30, 0.50, 0.15, 0.05, 0.00],
-                [0.10, 0.30, 0.45, 0.12, 0.03],
-                [0.05, 0.10, 0.25, 0.40, 0.20],
-                [0.00, 0.04, 0.06, 0.30, 0.60],
-            ])
             sev = (self.pd_base - 0.02) / (0.12 - 0.02)
-            mat = base.copy()
-            mat[1:] *= 1 + sev
-            mat = mat / mat.sum(axis=1, keepdims=True)
-            self.transition_matrix = mat
+            self.transition_matrix = generate_transition_matrix(DEFAULT_BUCKETS, sev)
 
     # distribuições de variáveis demográficas/financeiras serão geradas on‑the‑fly
 
-    def _delay_probs(self) -> np.ndarray:
-        """Retorna vetor de probs para [0, 15, 30, 60, 90] dias."""
-        base = np.array([1.0, 0.4, 0.25, 0.1, 0.05])
-        weight = (self.pd_base - 0.02) / (0.12 - 0.02)  # 0 (melhor) → 1 (pior)
-        # aumenta peso dos maiores atrasos nos grupos piores
+    def _delay_probs(self, buckets: List[int]) -> np.ndarray:
+        """Return probability vector for initial delay buckets."""
+        base = [1.0, 0.4, 0.25, 0.1, 0.05]
+        if len(buckets) > 5:
+            base.extend([0.05] * (len(buckets) - 5))
+        base = np.array(base[: len(buckets)], dtype=float)
+        weight = (self.pd_base - 0.02) / (0.12 - 0.02)
         scale = 1 + weight
-        scaled = np.array([
-            base[0] / scale,            # menos pontualidade nos piores
-            base[1],
-            base[2] * scale,
-            base[3] * scale * 1.3,
-            base[4] * scale * 1.6,
-        ])
+        scaled = base.copy()
+        scaled[0] /= scale
+        for i in range(2, len(buckets)):
+            scaled[i] *= scale * (1.3 if i == 3 else 1.6 if i >= 4 else 1.0)
         return scaled / scaled.sum()
 
     # ---------------------------------------------------------------------
@@ -75,7 +73,12 @@ class GroupProfile:
     # ---------------------------------------------------------------------
 
     def sample_contracts(
-        self, n: int, rng: np.random.Generator, *, id_offset: int = 0
+        self,
+        n: int,
+        rng: np.random.Generator,
+        *,
+        id_offset: int = 0,
+        buckets: List[int] | None = None,
     ) -> pd.DataFrame:
         """Gera *n* contratos sintéticos para este grupo."""
 
@@ -94,8 +97,10 @@ class GroupProfile:
         df["safra"] = df["data_ref"].dt.strftime("%Y%m")
 
         # Variáveis principais
+        if buckets is None:
+            buckets = DEFAULT_BUCKETS
         df["dias_atraso"] = rng.choice(
-            [0, 15, 30, 60, 90], size=n, p=self._delay_probs()
+            buckets, size=n, p=self._delay_probs(buckets)
         ).astype("int16")
         df["nivel_refinanciamento"] = np.zeros(n, dtype="int8")
 
@@ -150,13 +155,63 @@ class GroupProfile:
         df["streak_90"] = np.where(df["dias_atraso"] == 90, 1, 0).astype("int8")
         df["ever90m12"] = np.zeros(n, dtype="int8")
         df["over90m12"] = np.zeros(n, dtype="int8")
+        df["ever360m18"] = np.zeros(n, dtype="int8")
         df["flag_cura"] = np.zeros(n, dtype="int8")
+        df["write_off"] = np.zeros(n, dtype="int8")
 
         return df
 
 # =============================================================================
 # Helpers
 # =============================================================================
+
+def bucket_index(delay: int, buckets: List[int]) -> int:
+    """Return index of largest bucket <= delay."""
+    idx = np.searchsorted(buckets, delay, side="right") - 1
+    if idx < 0:
+        return 0
+    if idx >= len(buckets):
+        return len(buckets) - 1
+    return int(idx)
+
+
+def generate_transition_matrix(buckets: List[int], sev: float) -> np.ndarray:
+    """Create default transition matrix given buckets and severity."""
+    n = len(buckets)
+    if n < 5:
+        raise ValueError("n_buckets must be >= 5")
+
+    stay = np.array([0.6 + 0.05 * i / (n - 1) for i in range(n)], dtype=float)
+    up = np.array([0.3 - 0.02 * i for i in range(n)], dtype=float)
+    down = np.array([0.1 - 0.03 * i / (n - 1) for i in range(n)], dtype=float)
+
+    mat = np.zeros((n, n), dtype=float)
+    for i in range(n):
+        if i == 0:
+            mat[i, i] = stay[i]
+            mat[i, i + 1] = 1 - mat[i, i]
+        elif i == n - 1:
+            mat[i, i] = stay[i]
+            mat[i, i - 1] = 1 - mat[i, i]
+        else:
+            mat[i, i] = stay[i]
+            mat[i, i + 1] = up[i]
+            mat[i, i - 1] = down[i]
+            s = mat[i].sum()
+            if s != 1:
+                mat[i, i] += 1 - s
+
+    # aplica severidade escalando saídas (exceto diagonal)
+    for i in range(1, n):
+        diag = mat[i, i]
+        off = mat[i].copy()
+        off[i] = 0
+        off *= 1 + sev
+        mat[i] = off
+        mat[i, i] = diag
+        mat[i] /= mat[i].sum()
+
+    return mat
 
 def default_group_profiles(n_groups: int) -> List[GroupProfile]:
     """Cria *n_groups* perfis padrão numerados GH1…GHn.
@@ -185,7 +240,15 @@ def default_group_profiles(n_groups: int) -> List[GroupProfile]:
 # =============================================================================
 
 class CreditDataSynthesizer:
-    """Gera snapshot, painel e rastro de renegociação."""
+    """Gera snapshot, painel e rastro de renegociação.
+
+    Parameters
+    ----------
+    buckets : list[int], optional
+        Lista global de buckets de atraso. Se ``None``, usa ``[0,15,30,60,90]``.
+    writeoff_bucket : int, optional
+        Se definido, marca ``write_off`` quando ``dias_atraso`` ≥ esse valor.
+    """
 
     def __init__(
         self,
@@ -196,12 +259,21 @@ class CreditDataSynthesizer:
         random_seed: int = 42,
         kernel_trick: bool = True,
         start_safra: str | pd.Timestamp | int | None = None,
+        buckets: List[int] | None = None,
+        writeoff_bucket: int | None = None,
     ) -> None:
         self.group_profiles = group_profiles
         self.contracts_per_group = contracts_per_group
         self.n_safras = n_safras
         self.kernel_trick = kernel_trick
         self.rng = np.random.default_rng(random_seed)
+        self.buckets = sorted(buckets if buckets is not None else DEFAULT_BUCKETS)
+        self.writeoff_bucket = writeoff_bucket
+
+        for gp in self.group_profiles:
+            if gp.transition_matrix is None or gp.transition_matrix.shape[0] != len(self.buckets):
+                sev = (gp.pd_base - 0.02) / (0.12 - 0.02)
+                gp.transition_matrix = generate_transition_matrix(self.buckets, sev)
 
         if start_safra is None:
             self.start_safra = pd.Timestamp("today").normalize().replace(day=1)
@@ -247,8 +319,13 @@ class CreditDataSynthesizer:
         for g_idx, gp in enumerate(self.group_profiles):
             offset = g_idx * self.contracts_per_group
             df = gp.sample_contracts(
-                self.contracts_per_group, rng=self.rng, id_offset=offset
+                self.contracts_per_group,
+                rng=self.rng,
+                id_offset=offset,
+                buckets=self.buckets,
             )
+            if self.writeoff_bucket is not None:
+                df["write_off"] = 0
             df["data_ref"] = start_date
             df["safra"] = start_date.strftime("%Y%m")
 
@@ -292,8 +369,8 @@ class CreditDataSynthesizer:
         trace_records: List[dict],
     ) -> pd.DataFrame:
         df = df.copy()
-        buckets = np.array([0, 15, 30, 60, 90], dtype=np.int16)
-        idx_map = {0: 0, 15: 1, 30: 2, 60: 3, 90: 4}
+        buckets = np.array(self.buckets, dtype=np.int16)
+        n_buckets = len(buckets)
         for gp in self.group_profiles:
             mask = df["grupo_homogeneo"] == gp.name
             if not mask.any():
@@ -301,10 +378,10 @@ class CreditDataSynthesizer:
             sub = df.loc[mask]
 
             prev_delay = sub["dias_atraso"].to_numpy()
-            delay_idx = np.vectorize(idx_map.get)(prev_delay)
+            delay_idx = np.array([bucket_index(d, list(buckets)) for d in prev_delay], dtype=np.int16)
             mat = gp.transition_matrix
             new_idx = np.fromiter(
-                (self.rng.choice(5, p=mat[i]) for i in delay_idx), dtype=np.int16
+                (self.rng.choice(n_buckets, p=mat[i]) for i in delay_idx), dtype=np.int16
             )
             new_delay = buckets[new_idx]
 
@@ -319,6 +396,8 @@ class CreditDataSynthesizer:
             # atualiza atraso e contadores
             sub["dias_atraso"] = new_delay
             sub["streak_90"] = streak_90
+            if self.writeoff_bucket is not None:
+                sub.loc[new_delay >= self.writeoff_bucket, "write_off"] = 1
 
             # pagamentos e contagem consecutiva
             on_time = new_delay == 0
@@ -372,6 +451,7 @@ class CreditDataSynthesizer:
         self._panel = self._panel.sort_values(["id_contrato", "data_ref"])  # type: ignore[assignment]
         ever = np.zeros(len(self._panel), dtype="int8")
         over = np.zeros(len(self._panel), dtype="int8")
+        ever360 = np.zeros(len(self._panel), dtype="int8")
         cura = np.zeros(len(self._panel), dtype="int8")
 
         trace_map = {row.id_antigo: pd.Timestamp(row.data_evento) for row in self._trace.itertuples()}
@@ -383,24 +463,30 @@ class CreditDataSynthesizer:
             event_date = trace_map.get(cid)
             for i in range(len(delays)):
                 start = pd.Timestamp(dates[i])
-                horizon_end = start + pd.DateOffset(months=12)
-                future_delays = delays[i : i + 13]
-                if (future_delays >= 90).any() or (
-                    event_date is not None and start < event_date <= horizon_end
+                horizon_end_12 = start + pd.DateOffset(months=12)
+                horizon_end_18 = start + pd.DateOffset(months=18)
+                future_delays_12 = delays[i : i + 13]
+                future_delays_18 = delays[i : i + 19]
+                if (future_delays_12 >= 90).any() or (
+                    event_date is not None and start < event_date <= horizon_end_12
                 ):
                     ever[idx[i]] = 1
 
-                idx90 = np.where(future_delays >= 90)[0]
+                idx90 = np.where(future_delays_12 >= 90)[0]
                 if len(idx90) > 0:
                     first = idx90[0]
-                    if (future_delays[first:] >= 30).all():
+                    if (future_delays_12[first:] >= 30).all():
                         over[idx[i]] = 1
+
+                if (future_delays_18 >= 360).any():
+                    ever360[idx[i]] = 1
 
                 if i > 0 and delays[i] < 90 and delays[i - 1] >= 90:
                     cura[idx[i]] = 1
 
         self._panel["ever90m12"] = ever
         self._panel["over90m12"] = over
+        self._panel["ever360m18"] = ever360
         self._panel["flag_cura"] = cura
 
         start_date = self._panel["data_ref"].min()
