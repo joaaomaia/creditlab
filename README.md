@@ -71,7 +71,8 @@ synth = CreditDataSynthesizer(
     n_groups=4,
     contracts_per_group=10000,
     n_safras=24,
-    seed=42
+    seed=42,
+    buckets=[0,15,30,60,90,120,180,240,360]
 )
 
 df_snapshot, df_panel, df_trace = synth.generate()
