@@ -36,13 +36,26 @@ class TargetSampler:
         If True, **nunca** remove linhas positivas; apenas downsamples negativas.
         Se False, aplica amostragem simétrica (pode remover positivos ou negativos
         conforme necessário).
+    per_group : bool, default False
+        Se True, aplica balanceamento dentro de cada ``grupo_homogeneo`` e safra.
+    min_pos : int, default 5
+        Número mínimo de positivos por grupo antes do downsample (com oversampling).
     """
 
-    def __init__(self, target_ratio: float = 0.10, *, keep_positives: bool = True):
+    def __init__(
+        self,
+        target_ratio: float = 0.10,
+        *,
+        keep_positives: bool = True,
+        per_group: bool = False,
+        min_pos: int = 5,
+    ):
         if not 0 < target_ratio < 1:
             raise ValueError("target_ratio must be between 0 and 1 (exclusive)")
         self.target_ratio = target_ratio
         self.keep_positives = keep_positives
+        self.per_group = per_group
+        self.min_pos = min_pos
 
     # ------------------------------------------------------------------
     # Core API
@@ -53,18 +66,31 @@ class TargetSampler:
         *,
         target_col: str = "ever90m12",
         safra_col: str = "safra",
+        group_col: str = "grupo_homogeneo",
         random_state: int | None = None,
     ) -> pd.DataFrame:
         """Return a new DataFrame with rebalanced target prevalence por safra."""
         rng = np.random.default_rng(random_state)
         pieces: List[pd.DataFrame] = []
+        group_keys = [safra_col]
+        if self.per_group:
+            group_keys.append(group_col)
 
-        for safra, grp in panel.groupby(safra_col, sort=False):
+        for keys, grp in panel.groupby(group_keys, sort=False):
             pos = grp[grp[target_col] == 1]
             neg = grp[grp[target_col] == 0]
 
             n_pos = len(pos)
             n_neg = len(neg)
+            if n_pos < self.min_pos and n_pos > 0:
+                extra = pos.sample(self.min_pos - n_pos, replace=True, random_state=rng.integers(0, 1_000_000))
+                num_cols = extra.select_dtypes(include=["float", "int"]).columns.difference([target_col])
+                for col in num_cols:
+                    std = extra[col].std() if extra[col].std() > 0 else 1
+                    extra[col] += rng.normal(0, std * 0.01, size=len(extra))
+                pos = pd.concat([pos, extra], ignore_index=True)
+                n_pos = len(pos)
+
             if n_pos == 0 or n_neg == 0:
                 pieces.append(grp)
                 continue
@@ -72,14 +98,19 @@ class TargetSampler:
             # razão atual
             r = n_pos / (n_pos + n_neg)
             if self.keep_positives:
-                if r >= self.target_ratio:
-                    # já está >= alvo → mantém como está
-                    pieces.append(grp)
-                    continue
-                # precisamos reduzir negativos
                 new_neg_n = int(n_pos * (1 - self.target_ratio) / self.target_ratio)
-                sampled_neg_idx = rng.choice(neg.index, size=new_neg_n, replace=False)
-                grp_bal = pd.concat([pos, neg.loc[sampled_neg_idx]], ignore_index=True)
+                if n_neg >= new_neg_n:
+                    sampled_neg_idx = rng.choice(neg.index, size=new_neg_n, replace=False)
+                    neg = neg.loc[sampled_neg_idx]
+                else:
+                    extra_idx = rng.choice(neg.index, size=new_neg_n - n_neg, replace=True)
+                    extra = neg.loc[extra_idx].copy()
+                    num_cols = extra.select_dtypes(include=["float", "int"]).columns.difference([target_col])
+                    for col in num_cols:
+                        std = extra[col].std() if extra[col].std() > 0 else 1
+                        extra[col] += rng.normal(0, std * 0.01, size=len(extra))
+                    neg = pd.concat([neg, extra], ignore_index=True)
+                grp_bal = pd.concat([pos, neg], ignore_index=True)
             else:
                 # amostragem simétrica (pode reduzir qualquer lado)
                 total_desired = int((n_pos + n_neg))  # preserva tamanho
