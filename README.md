@@ -35,6 +35,12 @@ Evolução mês a mês dos contratos, incluindo comportamento, eventos e targets
 ### `df_trace`
 Rastro de contratos **renegociados**, com relação entre contratos antigos e novos.
 
+### `df_clients`
+Registro único de clientes com `id_cliente`, `data_nascimento` e `sexo`. Pode ser
+associado aos contratos via `id_cliente`.
+Caso precise da idade do cliente em determinado `data_ref`, basta calcular
+`idade_cliente = (data_ref - data_nascimento).dt.days // 365`.
+
 ---
 
 ## 🧪 Exemplos de Aplicações

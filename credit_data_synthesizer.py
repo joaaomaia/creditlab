@@ -65,6 +65,7 @@ class GroupProfile:
     refin_prob: float  # probabilidade de aceitar refinanciamento quando elegível
     reneg_prob_exog: float  # prob mensal de renegociação exógena (fora trigger 90d)
     transition_matrix: np.ndarray | None = None  # matriz de transição
+    num_clients: int | None = None  # numero de clientes distintos no grupo
 
     def __post_init__(self) -> None:
         if self.transition_matrix is None:
@@ -102,6 +103,7 @@ class GroupProfile:
         *,
         id_offset: int = 0,
         buckets: List[int] | None = None,
+        start_safra: pd.Timestamp | None = None,
     ) -> pd.DataFrame:
         """Gera *n* contratos sintéticos para este grupo."""
 
@@ -109,14 +111,17 @@ class GroupProfile:
 
         # Identificadores
         df["id_contrato"] = id_offset + np.arange(n, dtype="int64")
-        df["id_cliente"] = rng.integers(1e9, 2e9, size=n, dtype="int64")
         df["grupo_homogeneo"] = self.name
 
+        if start_safra is None:
+            ref_start = pd.Timestamp("today").normalize().replace(day=1)
+        else:
+            ref_start = start_safra
         # Datas
-        df["data_inicio_contrato"] = pd.Timestamp("today").normalize() - pd.to_timedelta(
-            rng.integers(0, 365, n), unit="D"
+        df["data_inicio_contrato"] = ref_start - pd.to_timedelta(
+            rng.integers(0, 180, n), unit="D"
         )
-        df["data_ref"] = pd.Timestamp("today").normalize()
+        df["data_ref"] = ref_start
         df["safra"] = df["data_ref"].dt.strftime("%Y%m")
 
         # Variáveis principais
@@ -128,10 +133,8 @@ class GroupProfile:
         df["nivel_refinanciamento"] = np.zeros(n, dtype="int8")
 
         # -----------------------------------------------------------------
-        # Demográficas (estáticas)
+        # Demográficas (estáticas) - preenchidas depois pelo sintetizador
         # -----------------------------------------------------------------
-        df["idade_cliente"] = rng.integers(18, 75, size=n, dtype="int8")
-        df["sexo"] = rng.choice(["M", "F", "N"], size=n, p=[0.48, 0.48, 0.04])
         df["renda_mensal"] = (
             rng.normal(4000 * (1 + 0.3 * (1 - self.pd_base / 0.12)), 1500, size=n)
             .clip(500, 50_000)
@@ -187,6 +190,10 @@ class GroupProfile:
 # =============================================================================
 # Helpers
 # =============================================================================
+
+def random_contract_start(rng: np.random.Generator, start_safra: pd.Timestamp) -> pd.Timestamp:
+    """Return random contract start date not after ``start_safra``."""
+    return start_safra - pd.to_timedelta(rng.integers(0, 180), unit="D")
 
 def bucket_index(delay: int, buckets: List[int]) -> int:
     """Return index of largest bucket <= delay."""
@@ -369,10 +376,81 @@ class CreditDataSynthesizer:
                 raise TypeError("start_safra must be str, int, Timestamp or None")
             self.start_safra = self.start_safra.normalize().replace(day=1)
 
+        # gera registro de clientes unico ---------------------------------
+        self._init_clients()
+
         # DataFrames de saída
         self._snapshot: pd.DataFrame | None = None
         self._panel: pd.DataFrame | None = None
         self._trace: pd.DataFrame | None = None
+
+    # ------------------------------------------------------------------
+    def _init_clients(self) -> None:
+        """Generate global clients registry."""
+        counts = []
+        for gp in self.group_profiles:
+            c = gp.num_clients if gp.num_clients is not None else int(self.contracts_per_group * 0.8)
+            if c < 1:
+                c = 1
+            counts.append(c)
+        offsets = np.cumsum([0] + counts)
+        self._client_offsets = offsets
+        total = offsets[-1]
+        ids = self.rng.choice(np.arange(int(1e9), int(2e9)), size=total, replace=False)
+        start = pd.Timestamp("1945-01-01")
+        end = pd.Timestamp("2005-12-31")
+        days = (end - start).days
+        births = start + pd.to_timedelta(self.rng.integers(0, days + 1, size=total), unit="D")
+        sex = self.rng.choice(["M", "F", "N"], size=total, p=[0.48, 0.48, 0.04])
+        self._clients = pd.DataFrame({
+            "id_cliente": ids.astype("int64"),
+            "data_nascimento": births,
+            "sexo": sex,
+        })
+        self._start_pairs: set[tuple[int, str]] = set()
+
+    def _assign_contract_to_client(
+        self,
+        pool: np.ndarray,
+        start: pd.Timestamp,
+    ) -> tuple[int, pd.Timestamp]:
+        """Return client id and (possibly adjusted) start date avoiding collisions."""
+        cid = int(self.rng.choice(pool))
+        date = start
+        safra = date.strftime("%Y%m")
+        pair = (cid, safra)
+        if pair not in self._start_pairs:
+            self._start_pairs.add(pair)
+            return cid, date
+        # try nudging date
+        for _ in range(5):
+            delta = int(self.rng.integers(1, 4))
+            sign = int(self.rng.choice([-1, 1]))
+            new_date = date + pd.DateOffset(months=sign * delta)
+            if new_date > self.start_safra:
+                new_date = self.start_safra - pd.DateOffset(months=delta)
+            if new_date < pd.Timestamp("1900-01-01"):
+                new_date = self.start_safra
+            safra = new_date.strftime("%Y%m")
+            pair = (cid, safra)
+            if pair not in self._start_pairs and new_date <= self.start_safra:
+                self._start_pairs.add(pair)
+                return cid, new_date
+        # fallback other client id
+        for _ in range(10):
+            cid2 = int(self.rng.choice(pool))
+            pair = (cid2, date.strftime("%Y%m"))
+            if pair not in self._start_pairs:
+                self._start_pairs.add(pair)
+                return cid2, date
+        # ultimate fallback
+        while True:
+            cid2 = int(self.rng.choice(pool))
+            new_date = random_contract_start(self.rng, self.start_safra)
+            pair = (cid2, new_date.strftime("%Y%m"))
+            if pair not in self._start_pairs:
+                self._start_pairs.add(pair)
+                return cid2, new_date
 
     # ---------------------------------------------------------------------
     # API pública
@@ -404,19 +482,31 @@ class CreditDataSynthesizer:
                 rng=self.rng,
                 id_offset=offset,
                 buckets=self.buckets,
+                start_safra=start_date,
             )
             if self.writeoff_bucket is not None:
                 df["write_off"] = 0
+
+            start_slice, end_slice = self._client_offsets[g_idx], self._client_offsets[g_idx + 1]
+            pool = self._clients.iloc[start_slice:end_slice]
+            ids = pool["id_cliente"].to_numpy()
+            birth_map = pool.set_index("id_cliente")["data_nascimento"].to_dict()
+            sex_map = pool.set_index("id_cliente")["sexo"].to_dict()
+            for idx in df.index:
+                cid, dt = self._assign_contract_to_client(ids, df.at[idx, "data_inicio_contrato"])
+                df.at[idx, "data_inicio_contrato"] = dt
+                df.at[idx, "id_cliente"] = cid
+                df.at[idx, "data_nascimento"] = birth_map[cid]
+                df.at[idx, "sexo"] = sex_map[cid]
+
             df["data_ref"] = start_date
             df["safra"] = start_date.strftime("%Y%m")
 
-            # Kernel‑trick: bucketing por quantis de renda × idade → subclusters
-            if self.kernel_trick and {"renda_mensal", "idade_cliente"} <= set(df.columns):
+            if self.kernel_trick:
+                age = ((df["data_ref"] - df["data_nascimento"]).dt.days // 365).astype("int16")
                 q_renda = pd.qcut(df["renda_mensal"], q=4, labels=False, duplicates="drop")
-                q_idade = pd.qcut(df["idade_cliente"], q=4, labels=False, duplicates="drop")
-                df["subcluster"] = (
-                    (q_renda.astype("int8").to_numpy() * 4) + q_idade.astype("int8").to_numpy()
-                ).astype("int8")
+                q_age = pd.qcut(age, q=4, labels=False, duplicates="drop")
+                df["subcluster"] = ((q_renda.astype("int8") * 4) + q_age.astype("int8")).astype("int8")
 
             records.append(df)
 
@@ -512,7 +602,6 @@ class CreditDataSynthesizer:
                 sub.at[idx, "nivel_refinanciamento"] = 0
                 sub.at[idx, "dias_atraso"] = 0
                 sub.at[idx, "streak_90"] = 0
-                sub.at[idx, "data_inicio_contrato"] = ref_date
                 sub.at[idx, "safra"] = ref_date.strftime("%Y%m")
                 sub.at[idx, "num_parcelas_pagas"] = 0
                 sub.at[idx, "data_ult_pgt"] = ref_date
@@ -535,10 +624,18 @@ class CreditDataSynthesizer:
         ever360 = np.zeros(len(self._panel), dtype="int8")
         cura = np.zeros(len(self._panel), dtype="int8")
 
+        idx_90 = next(i for i, b in enumerate(self.buckets) if b >= 90)
+        try:
+            idx_360 = next(i for i, b in enumerate(self.buckets) if b >= 360)
+        except StopIteration:
+            idx_360 = len(self.buckets) - 1
+        idx_30 = next(i for i, b in enumerate(self.buckets) if b >= 30)
+
         trace_map = {row.id_antigo: pd.Timestamp(row.data_evento) for row in self._trace.itertuples()}
 
         for cid, grp in self._panel.groupby("id_contrato"):
             delays = grp["dias_atraso"].to_numpy()
+            delay_idx = np.array([bucket_index(d, self.buckets) for d in delays], dtype=int)
             dates = pd.to_datetime(grp["data_ref"]).to_numpy()
             idx = grp.index.to_numpy()
             event_date = trace_map.get(cid)
@@ -546,23 +643,23 @@ class CreditDataSynthesizer:
                 start = pd.Timestamp(dates[i])
                 horizon_end_12 = start + pd.DateOffset(months=12)
                 horizon_end_18 = start + pd.DateOffset(months=18)
-                future_delays_12 = delays[i : i + 13]
-                future_delays_18 = delays[i : i + 19]
-                if (future_delays_12 >= 90).any() or (
+                future_idx_12 = delay_idx[i : i + 13]
+                future_idx_18 = delay_idx[i : i + 19]
+                if (future_idx_12 >= idx_90).any() or (
                     event_date is not None and start < event_date <= horizon_end_12
                 ):
                     ever[idx[i]] = 1
 
-                idx90 = np.where(future_delays_12 >= 90)[0]
+                idx90 = np.where(future_idx_12 >= idx_90)[0]
                 if len(idx90) > 0:
                     first = idx90[0]
-                    if (future_delays_12[first:] >= 30).all():
+                    if (future_idx_12[first:] >= idx_30).all():
                         over[idx[i]] = 1
 
-                if (future_delays_18 >= 360).any():
+                if (future_idx_18 >= idx_360).any():
                     ever360[idx[i]] = 1
 
-                if i > 0 and delays[i] < 90 and delays[i - 1] >= 90:
+                if i > 0 and delay_idx[i] < idx_90 and delay_idx[i - 1] >= idx_90:
                     cura[idx[i]] = 1
 
         self._panel["ever90m12"] = ever
@@ -597,6 +694,10 @@ class CreditDataSynthesizer:
         if self._trace is None:
             raise RuntimeError("Call generate() first.")
         return self._trace
+
+    @property
+    def clients(self) -> pd.DataFrame:
+        return self._clients.copy()
 
 
 # ###############################################################################
