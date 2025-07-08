@@ -35,7 +35,23 @@ class GroupProfile:
     name: str
     pd_base: float  # PD 12m baseline (pior grupo ≈ 0.12, melhor ≈ 0.02)
     refin_prob: float  # probabilidade de aceitar refinanciamento quando elegível
-    reneg_prob: float  # prob mensal de renegociação exógena (além do trigger 90d)
+    reneg_prob_exog: float  # prob mensal de renegociação exógena (fora trigger 90d)
+    transition_matrix: np.ndarray | None = None  # shape (5,5) [0,15,30,60,90]
+
+    def __post_init__(self) -> None:
+        if self.transition_matrix is None:
+            base = np.array([
+                [0.80, 0.15, 0.04, 0.01, 0.00],
+                [0.30, 0.50, 0.15, 0.05, 0.00],
+                [0.10, 0.30, 0.45, 0.12, 0.03],
+                [0.05, 0.10, 0.25, 0.40, 0.20],
+                [0.00, 0.04, 0.06, 0.30, 0.60],
+            ])
+            sev = (self.pd_base - 0.02) / (0.12 - 0.02)
+            mat = base.copy()
+            mat[1:] *= 1 + sev
+            mat = mat / mat.sum(axis=1, keepdims=True)
+            self.transition_matrix = mat
 
     # distribuições de variáveis demográficas/financeiras serão geradas on‑the‑fly
 
@@ -128,7 +144,10 @@ class GroupProfile:
         df["data_ult_pgt"] = (
             df["data_inicio_contrato"] + pd.to_timedelta(df["num_parcelas_pagas"] * 30, unit="D")
         )
+        df["num_parcelas_pagas_consecutivas"] = df["num_parcelas_pagas"].astype("int16")
         df["score_latente"] = rng.normal(0, 1, size=n).astype("float32")
+        df["qtd_renegociacoes"] = np.zeros(n, dtype="int16")
+        df["streak_90"] = np.where(df["dias_atraso"] == 90, 1, 0).astype("int8")
         df["ever90m12"] = np.zeros(n, dtype="int8")
         df["over90m12"] = np.zeros(n, dtype="int8")
         df["flag_cura"] = np.zeros(n, dtype="int8")
@@ -156,7 +175,7 @@ def default_group_profiles(n_groups: int) -> List[GroupProfile]:
                 name=f"GH{i+1}",
                 pd_base=pd_base,
                 refin_prob=refin_prob,
-                reneg_prob=reneg_prob,
+                reneg_prob_exog=reneg_prob,
             )
         )
     return profiles
@@ -273,39 +292,55 @@ class CreditDataSynthesizer:
         trace_records: List[dict],
     ) -> pd.DataFrame:
         df = df.copy()
+        buckets = np.array([0, 15, 30, 60, 90], dtype=np.int16)
+        idx_map = {0: 0, 15: 1, 30: 2, 60: 3, 90: 4}
         for gp in self.group_profiles:
             mask = df["grupo_homogeneo"] == gp.name
             if not mask.any():
                 continue
             sub = df.loc[mask]
 
-            # Probabilidades de transição simples: cura vs piora
-            escalate_p = gp.pd_base
-            cure_p = 0.1 + 0.2 * (1 - gp.pd_base / 0.12)
+            prev_delay = sub["dias_atraso"].to_numpy()
+            delay_idx = np.vectorize(idx_map.get)(prev_delay)
+            mat = gp.transition_matrix
+            new_idx = np.fromiter(
+                (self.rng.choice(5, p=mat[i]) for i in delay_idx), dtype=np.int16
+            )
+            new_delay = buckets[new_idx]
 
-            rnd = self.rng.random(len(sub))
-            escalate = rnd < escalate_p
-            rnd2 = self.rng.random(len(sub))
-            cure = rnd2 < cure_p
+            # triggers
+            prev_streak90 = sub["streak_90"].to_numpy()
+            enter_60 = (prev_delay < 60) & (new_delay >= 60)
+            trigger1 = enter_60 & (self.rng.random(len(sub)) < gp.reneg_prob_exog)
+            streak_90 = np.where(new_delay == 90, prev_streak90 + 1, 0)
+            trigger2 = (streak_90 >= 3) & (new_delay == 90)
+            reneg_mask = trigger1 | trigger2
 
-            new_delay = sub["dias_atraso"].to_numpy()
-            new_delay[escalate] = np.clip(new_delay[escalate] + 15, 0, 90)
-            new_delay[cure] = np.clip(new_delay[cure] - 15, 0, 90)
+            # atualiza atraso e contadores
             sub["dias_atraso"] = new_delay
+            sub["streak_90"] = streak_90
+
+            # pagamentos e contagem consecutiva
+            on_time = new_delay == 0
+            sub.loc[on_time, "saldo_devedor"] = (
+                sub.loc[on_time, "saldo_devedor"] - sub.loc[on_time, "valor_parcela"]
+            ).clip(lower=0)
+            sub.loc[on_time, "num_parcelas_pagas"] += 1
+            sub.loc[on_time, "data_ult_pgt"] = ref_date
+            sub.loc[on_time, "num_parcelas_pagas_consecutivas"] += 1
+            sub.loc[~on_time, "num_parcelas_pagas_consecutivas"] = 0
 
             # Refinanciamento
-            refin_mask = (sub["dias_atraso"] <= 15) & (
-                self.rng.random(len(sub)) < gp.refin_prob * 0.05
+            refin_mask = (
+                on_time
+                & (sub["num_parcelas_pagas_consecutivas"] >= 4)
+                & (self.rng.random(len(sub)) < gp.refin_prob)
             )
             sub.loc[refin_mask, "nivel_refinanciamento"] += 1
             sub.loc[refin_mask, "saldo_devedor"] *= 1.1
-            sub.loc[refin_mask, "dias_atraso"] = 0
+            sub.loc[refin_mask, "num_parcelas_pagas_consecutivas"] = 0
 
             # Renegociação
-            reneg_mask = (sub["dias_atraso"] >= 60) & (
-                (sub["dias_atraso"] >= 90)
-                | (self.rng.random(len(sub)) < gp.reneg_prob)
-            )
             for idx in sub.index[reneg_mask]:
                 old_id = int(sub.at[idx, "id_contrato"])
                 new_id = int(self._id_counter)
@@ -316,18 +351,13 @@ class CreditDataSynthesizer:
                 sub.at[idx, "id_contrato"] = new_id
                 sub.at[idx, "nivel_refinanciamento"] = 0
                 sub.at[idx, "dias_atraso"] = 0
+                sub.at[idx, "streak_90"] = 0
                 sub.at[idx, "data_inicio_contrato"] = ref_date
                 sub.at[idx, "safra"] = ref_date.strftime("%Y%m")
                 sub.at[idx, "num_parcelas_pagas"] = 0
                 sub.at[idx, "data_ult_pgt"] = ref_date
-
-            # Pagamentos
-            on_time = sub["dias_atraso"] == 0
-            sub.loc[on_time, "saldo_devedor"] = (
-                sub.loc[on_time, "saldo_devedor"] - sub.loc[on_time, "valor_parcela"]
-            ).clip(lower=0)
-            sub.loc[on_time, "num_parcelas_pagas"] += 1
-            sub.loc[on_time, "data_ult_pgt"] = ref_date
+                sub.at[idx, "num_parcelas_pagas_consecutivas"] = 0
+                sub.at[idx, "qtd_renegociacoes"] += 1
 
             df.loc[mask] = sub
 
@@ -344,15 +374,28 @@ class CreditDataSynthesizer:
         over = np.zeros(len(self._panel), dtype="int8")
         cura = np.zeros(len(self._panel), dtype="int8")
 
-        for _, grp in self._panel.groupby("id_contrato"):
+        trace_map = {row.id_antigo: pd.Timestamp(row.data_evento) for row in self._trace.itertuples()}
+
+        for cid, grp in self._panel.groupby("id_contrato"):
             delays = grp["dias_atraso"].to_numpy()
+            dates = pd.to_datetime(grp["data_ref"]).to_numpy()
             idx = grp.index.to_numpy()
+            event_date = trace_map.get(cid)
             for i in range(len(delays)):
-                future = delays[i : i + 13]
-                if (future >= 90).any():
+                start = pd.Timestamp(dates[i])
+                horizon_end = start + pd.DateOffset(months=12)
+                future_delays = delays[i : i + 13]
+                if (future_delays >= 90).any() or (
+                    event_date is not None and start < event_date <= horizon_end
+                ):
                     ever[idx[i]] = 1
-                if len(future) > 12 and future[12] >= 90:
-                    over[idx[i]] = 1
+
+                idx90 = np.where(future_delays >= 90)[0]
+                if len(idx90) > 0:
+                    first = idx90[0]
+                    if (future_delays[first:] >= 30).all():
+                        over[idx[i]] = 1
+
                 if i > 0 and delays[i] < 90 and delays[i - 1] >= 90:
                     cura[idx[i]] = 1
 
