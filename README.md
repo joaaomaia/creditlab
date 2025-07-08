@@ -78,6 +78,19 @@ synth = CreditDataSynthesizer(
 df_snapshot, df_panel, df_trace = synth.generate()
 ```
 
+Exemplo definindo uma matriz BASE personalizada:
+
+```python
+import numpy as np
+from creditlab import default_group_profiles
+
+base = np.eye(5)
+synth = CreditDataSynthesizer(
+    group_profiles=default_group_profiles(3),
+    base_matrix=base,
+)
+```
+
 ---
 
 
