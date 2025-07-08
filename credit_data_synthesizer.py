@@ -111,6 +111,25 @@ class GroupProfile:
         df["ltv_inicial_pct"] = rng.uniform(40, 100, size=n).astype("float32")
         df["renda_liquida_disp_pct"] = rng.uniform(0.1, 0.8, size=n).astype("float32")
 
+        # -----------------------------------------------------------------
+        # Variáveis financeiras adicionais para completar 30+ colunas
+        # -----------------------------------------------------------------
+        df["prazo_meses"] = rng.integers(6, 60, size=n, dtype="int16")
+        df["taxa_juros_anual_pct"] = rng.uniform(10, 40, size=n).astype("float32")
+        df["valor_liberado"] = rng.uniform(2000, 50_000, size=n).astype("float32")
+        df["saldo_devedor"] = df["valor_liberado"].astype("float32")
+        df["valor_parcela"] = (
+            df["saldo_devedor"] * (1 + df["taxa_juros_anual_pct"] / 100) / df["prazo_meses"]
+        ).astype("float32")
+        df["num_parcelas_pagas"] = rng.integers(0, 3, size=n, dtype="int16")
+        df["data_ult_pgt"] = (
+            df["data_inicio_contrato"] + pd.to_timedelta(df["num_parcelas_pagas"] * 30, unit="D")
+        )
+        df["score_latente"] = rng.normal(0, 1, size=n).astype("float32")
+        df["ever90m12"] = np.zeros(n, dtype="int8")
+        df["over90m12"] = np.zeros(n, dtype="int8")
+        df["flag_cura"] = np.zeros(n, dtype="int8")
+
         return df
 
 # =============================================================================
@@ -170,10 +189,17 @@ class CreditDataSynthesizer:
     # API pública
     # ---------------------------------------------------------------------
     def generate(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """Gera snapshot inicial, painel evolutivo e rastro de renegociação.
+
+        Returns
+        -------
+        Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
+            DataFrames de snapshot, painel e trace, respectivamente.
+        """
+
         self._generate_snapshot()
-        # Evolução & targets ficam para iteração futura — placeholder
-        self._panel = self._snapshot.copy()  # painel = snapshot quando n_safras=1
-        self._trace = pd.DataFrame(columns=["id_antigo", "id_novo", "data_evento"])
+        self._generate_panel()
+        self._compute_targets()
         return self._snapshot, self._panel, self._trace
 
     # ------------------------------------------------------------------
@@ -181,11 +207,14 @@ class CreditDataSynthesizer:
     # ------------------------------------------------------------------
     def _generate_snapshot(self) -> None:
         records: List[pd.DataFrame] = []
+        start_date = pd.Timestamp("today").normalize()
         for g_idx, gp in enumerate(self.group_profiles):
             offset = g_idx * self.contracts_per_group
             df = gp.sample_contracts(
                 self.contracts_per_group, rng=self.rng, id_offset=offset
             )
+            df["data_ref"] = start_date
+            df["safra"] = start_date.strftime("%Y%m")
 
             # Kernel‑trick: bucketing por quantis de renda × idade → subclusters
             if self.kernel_trick and {"renda_mensal", "idade_cliente"} <= set(df.columns):
@@ -198,6 +227,128 @@ class CreditDataSynthesizer:
             records.append(df)
 
         self._snapshot = pd.concat(records, ignore_index=True, copy=False)
+
+    # ------------------------------------------------------------------
+    # Passo 2: evolução mensal
+    # ------------------------------------------------------------------
+    def _generate_panel(self) -> None:
+        assert self._snapshot is not None
+
+        current = self._snapshot.copy()
+        start_date = current["data_ref"].iloc[0]
+        self._id_counter = int(current["id_contrato"].max()) + 1
+        traces: List[dict] = []
+        records = [current.copy()]
+
+        for m in range(1, self.n_safras):
+            ref_date = start_date + pd.DateOffset(months=m)
+            current = self._evolve_one_month(current, ref_date, traces)
+            records.append(current.copy())
+
+        self._panel = pd.concat(records, ignore_index=True)
+        self._trace = pd.DataFrame(traces, columns=["id_antigo", "id_novo", "data_evento"])
+
+    # ------------------------------------------------------------------
+    def _evolve_one_month(
+        self,
+        df: pd.DataFrame,
+        ref_date: pd.Timestamp,
+        trace_records: List[dict],
+    ) -> pd.DataFrame:
+        df = df.copy()
+        for gp in self.group_profiles:
+            mask = df["grupo_homogeneo"] == gp.name
+            if not mask.any():
+                continue
+            sub = df.loc[mask]
+
+            # Probabilidades de transição simples: cura vs piora
+            escalate_p = gp.pd_base
+            cure_p = 0.1 + 0.2 * (1 - gp.pd_base / 0.12)
+
+            rnd = self.rng.random(len(sub))
+            escalate = rnd < escalate_p
+            rnd2 = self.rng.random(len(sub))
+            cure = rnd2 < cure_p
+
+            new_delay = sub["dias_atraso"].to_numpy()
+            new_delay[escalate] = np.clip(new_delay[escalate] + 15, 0, 90)
+            new_delay[cure] = np.clip(new_delay[cure] - 15, 0, 90)
+            sub["dias_atraso"] = new_delay
+
+            # Refinanciamento
+            refin_mask = (sub["dias_atraso"] <= 15) & (
+                self.rng.random(len(sub)) < gp.refin_prob * 0.05
+            )
+            sub.loc[refin_mask, "nivel_refinanciamento"] += 1
+            sub.loc[refin_mask, "saldo_devedor"] *= 1.1
+            sub.loc[refin_mask, "dias_atraso"] = 0
+
+            # Renegociação
+            reneg_mask = (sub["dias_atraso"] >= 60) & (
+                (sub["dias_atraso"] >= 90)
+                | (self.rng.random(len(sub)) < gp.reneg_prob)
+            )
+            for idx in sub.index[reneg_mask]:
+                old_id = int(sub.at[idx, "id_contrato"])
+                new_id = int(self._id_counter)
+                self._id_counter += 1
+                trace_records.append(
+                    {"id_antigo": old_id, "id_novo": new_id, "data_evento": ref_date}
+                )
+                sub.at[idx, "id_contrato"] = new_id
+                sub.at[idx, "nivel_refinanciamento"] = 0
+                sub.at[idx, "dias_atraso"] = 0
+                sub.at[idx, "data_inicio_contrato"] = ref_date
+                sub.at[idx, "safra"] = ref_date.strftime("%Y%m")
+                sub.at[idx, "num_parcelas_pagas"] = 0
+                sub.at[idx, "data_ult_pgt"] = ref_date
+
+            # Pagamentos
+            on_time = sub["dias_atraso"] == 0
+            sub.loc[on_time, "saldo_devedor"] = (
+                sub.loc[on_time, "saldo_devedor"] - sub.loc[on_time, "valor_parcela"]
+            ).clip(lower=0)
+            sub.loc[on_time, "num_parcelas_pagas"] += 1
+            sub.loc[on_time, "data_ult_pgt"] = ref_date
+
+            df.loc[mask] = sub
+
+        df["data_ref"] = ref_date
+        df["safra"] = ref_date.strftime("%Y%m")
+        return df
+
+    # ------------------------------------------------------------------
+    def _compute_targets(self) -> None:
+        assert self._panel is not None
+
+        self._panel = self._panel.sort_values(["id_contrato", "data_ref"])  # type: ignore[assignment]
+        ever = np.zeros(len(self._panel), dtype="int8")
+        over = np.zeros(len(self._panel), dtype="int8")
+        cura = np.zeros(len(self._panel), dtype="int8")
+
+        for _, grp in self._panel.groupby("id_contrato"):
+            delays = grp["dias_atraso"].to_numpy()
+            idx = grp.index.to_numpy()
+            for i in range(len(delays)):
+                future = delays[i : i + 13]
+                if (future >= 90).any():
+                    ever[idx[i]] = 1
+                if len(future) > 12 and future[12] >= 90:
+                    over[idx[i]] = 1
+                if i > 0 and delays[i] < 90 and delays[i - 1] >= 90:
+                    cura[idx[i]] = 1
+
+        self._panel["ever90m12"] = ever
+        self._panel["over90m12"] = over
+        self._panel["flag_cura"] = cura
+
+        start_date = self._panel["data_ref"].min()
+        self._snapshot = (
+            self._panel[self._panel["data_ref"] == start_date]
+            .copy()
+            .reset_index(drop=True)
+        )
 
     # ------------------------------------------------------------------
     # Properties de conveniência
