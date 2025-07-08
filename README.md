@@ -82,6 +82,7 @@ synth = CreditDataSynthesizer(
 )
 
 df_snapshot, df_panel, df_trace = synth.generate()
+df_panel = df_panel.merge(synth.clients, on="id_cliente")
 ```
 
 Exemplo definindo uma matriz BASE personalizada:
