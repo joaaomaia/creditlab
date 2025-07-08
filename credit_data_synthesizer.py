@@ -19,6 +19,13 @@ Exemplo de uso com buckets personalizados::
         group_profiles=default_group_profiles(4),
         buckets=[0,15,30,60,90,120,180,240,360],
     )
+
+    # também é possível definir uma matriz BASE personalizada
+    custom_base = np.eye(5)
+    synth = CreditDataSynthesizer(
+        group_profiles=default_group_profiles(4),
+        base_matrix=custom_base,
+    )
 """
 
 from __future__ import annotations
@@ -29,6 +36,18 @@ import numpy as np
 import pandas as pd
 
 DEFAULT_BUCKETS = [0, 15, 30, 60, 90]
+
+# matriz base padrao 5x5 para transicoes (sev=0)
+BASE_5x5 = np.array(
+    [
+        [0.6, 0.4, 0.0, 0.0, 0.0],
+        [0.0925, 0.6275, 0.28, 0.0, 0.0],
+        [0.0, 0.085, 0.655, 0.26, 0.0],
+        [0.0, 0.0, 0.0775, 0.6825, 0.24],
+        [0.0, 0.0, 0.0, 0.35, 0.65],
+    ],
+    dtype=float,
+)
 
 import warnings
 warnings.simplefilter(action='ignore', category=pd.errors.SettingWithCopyWarning)
@@ -50,7 +69,11 @@ class GroupProfile:
     def __post_init__(self) -> None:
         if self.transition_matrix is None:
             sev = (self.pd_base - 0.02) / (0.12 - 0.02)
-            self.transition_matrix = generate_transition_matrix(DEFAULT_BUCKETS, sev)
+            self.transition_matrix = generate_transition_matrix(
+                DEFAULT_BUCKETS,
+                sev,
+                base_mat=BASE_5x5,
+            )
 
     # distribuições de variáveis demográficas/financeiras serão geradas on‑the‑fly
 
@@ -175,42 +198,91 @@ def bucket_index(delay: int, buckets: List[int]) -> int:
     return int(idx)
 
 
-def generate_transition_matrix(buckets: List[int], sev: float) -> np.ndarray:
-    """Create default transition matrix given buckets and severity."""
+def _risk_score(mat: np.ndarray, buckets: List[int]) -> float:
+    """Return probability de sair do bucket 30 para atrasos >=60."""
+    try:
+        start = buckets.index(30)
+    except ValueError:
+        start = 0
+    try:
+        thr = next(i for i, b in enumerate(buckets) if b >= 60)
+    except StopIteration:
+        return 0.0
+    return float(mat[start, thr:].sum())
+
+
+def generate_transition_matrix(
+    buckets: List[int],
+    sev: float,
+    *,
+    base_mat: np.ndarray | None = None,
+    alpha: float = 0.6,
+    beta: float = 0.5,
+) -> np.ndarray:
+    """Return transition matrix ajustada pela severidade."""
+
     n = len(buckets)
     if n < 5:
         raise ValueError("n_buckets must be >= 5")
 
-    stay = np.array([0.6 + 0.05 * i / (n - 1) for i in range(n)], dtype=float)
-    up = np.array([0.3 - 0.02 * i for i in range(n)], dtype=float)
-    down = np.array([0.1 - 0.03 * i / (n - 1) for i in range(n)], dtype=float)
-
-    mat = np.zeros((n, n), dtype=float)
-    for i in range(n):
-        if i == 0:
-            mat[i, i] = stay[i]
-            mat[i, i + 1] = 1 - mat[i, i]
-        elif i == n - 1:
-            mat[i, i] = stay[i]
-            mat[i, i - 1] = 1 - mat[i, i]
+    if base_mat is not None:
+        mat = np.asarray(base_mat, dtype=float).copy()
+        if mat.shape != (n, n):
+            raise ValueError("base_mat shape must match number of buckets")
+    else:
+        if n == 5:
+            mat = BASE_5x5.copy()
         else:
-            mat[i, i] = stay[i]
-            mat[i, i + 1] = up[i]
-            mat[i, i - 1] = down[i]
-            s = mat[i].sum()
-            if s != 1:
-                mat[i, i] += 1 - s
+            # gera base generica para qualquer tamanho
+            stay = np.array([0.6 + 0.05 * i / (n - 1) for i in range(n)], dtype=float)
+            up = np.array([0.3 - 0.02 * i for i in range(n)], dtype=float)
+            down = np.array([0.1 - 0.03 * i / (n - 1) for i in range(n)], dtype=float)
+            mat = np.zeros((n, n), dtype=float)
+            for i in range(n):
+                if i == 0:
+                    mat[i, i] = stay[i]
+                    mat[i, i + 1] = 1 - mat[i, i]
+                elif i == n - 1:
+                    mat[i, i] = stay[i]
+                    mat[i, i - 1] = 1 - mat[i, i]
+                else:
+                    mat[i, i] = stay[i]
+                    mat[i, i + 1] = up[i]
+                    mat[i, i - 1] = down[i]
+                    s = mat[i].sum()
+                    if s != 1:
+                        mat[i, i] += 1 - s
 
-    # aplica severidade escalando saídas (exceto diagonal)
+    # aplica severidade --------------------------------------------------
+    # linha 0: reduz probabilidade de permanencia
+    mat[0, 0] *= max(0.0, 1 - beta * sev)
+    mat[0] /= mat[0].sum()
+
     for i in range(1, n):
         diag = mat[i, i]
         off = mat[i].copy()
         off[i] = 0
-        off *= 1 + sev
+        off *= 1 + alpha * sev
         mat[i] = off
         mat[i, i] = diag
         mat[i] /= mat[i].sum()
 
+    # garantias extras ---------------------------------------------------
+    for i in range(n):
+        if mat[i, i] < 0.01:
+            mat[i, i] = 0.01
+        mat[i] /= mat[i].sum()
+
+    # prob max de inadimplencia direta para ultimo bucket
+    last_idx = n - 1
+    if mat[0, last_idx] > 0.05:
+        excess = mat[0, last_idx] - 0.05
+        mat[0, last_idx] = 0.05
+        other = mat[0, :last_idx]
+        mat[0, :last_idx] = other / other.sum() * (1 - 0.05)
+
+    # normalizacao final
+    mat /= mat.sum(axis=1, keepdims=True)
     return mat
 
 def default_group_profiles(n_groups: int) -> List[GroupProfile]:
@@ -248,6 +320,9 @@ class CreditDataSynthesizer:
         Lista global de buckets de atraso. Se ``None``, usa ``[0,15,30,60,90]``.
     writeoff_bucket : int, optional
         Se definido, marca ``write_off`` quando ``dias_atraso`` ≥ esse valor.
+    base_matrix : np.ndarray, optional
+        Matriz BASE para gerar transições dos grupos. Deve ter shape
+        ``(len(buckets), len(buckets))``.
     """
 
     def __init__(
@@ -261,6 +336,7 @@ class CreditDataSynthesizer:
         start_safra: str | pd.Timestamp | int | None = None,
         buckets: List[int] | None = None,
         writeoff_bucket: int | None = None,
+        base_matrix: np.ndarray | None = None,
     ) -> None:
         self.group_profiles = group_profiles
         self.contracts_per_group = contracts_per_group
@@ -269,11 +345,16 @@ class CreditDataSynthesizer:
         self.rng = np.random.default_rng(random_seed)
         self.buckets = sorted(buckets if buckets is not None else DEFAULT_BUCKETS)
         self.writeoff_bucket = writeoff_bucket
+        self.base_matrix = base_matrix
 
         for gp in self.group_profiles:
             if gp.transition_matrix is None or gp.transition_matrix.shape[0] != len(self.buckets):
                 sev = (gp.pd_base - 0.02) / (0.12 - 0.02)
-                gp.transition_matrix = generate_transition_matrix(self.buckets, sev)
+                gp.transition_matrix = generate_transition_matrix(
+                    self.buckets,
+                    sev,
+                    base_mat=self.base_matrix,
+                )
 
         if start_safra is None:
             self.start_safra = pd.Timestamp("today").normalize().replace(day=1)
