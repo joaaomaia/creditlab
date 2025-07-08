@@ -75,3 +75,36 @@ synth = CreditDataSynthesizer(
 )
 
 df_snapshot, df_panel, df_trace = synth.generate()
+```
+
+---
+
+
+## 📚 Requisitos
+Python 3.8+
+
+pandas, numpy, dataclasses
+
+(futuramente) matplotlib, seaborn, scikit-learn para notebooks
+
+## 🎓 Mentoria
+Este repositório foi desenvolvido como parte de uma mentoria gratuita em ciência de dados aplicada ao risco de crédito, com foco técnico, regulatório e estratégico.
+
+Quer aprender mais ou participar?
+Entre em contato pelo LinkedIn ou envie um e-mail para [contato_riskpilot@gmail.com].
+
+## 📄 Licença
+Este projeto é livre para uso educacional e pessoal.
+Reutilização comercial requer autorização prévia.
+MIT-like para fins didáticos — cite com carinho. 🤝
+
+## 🚧 Roadmap (em desenvolvimento)
+ Gerador de carteiras com múltiplos produtos (consignado, pessoal, auto etc.)
+
+ Geração automática de curvas de cura
+
+ Módulo de explicabilidade com surrogate models
+
+ Simulação de perdas esperadas sob IFRS 9
+
+ Interface via notebook interativo (JupyterLab)
