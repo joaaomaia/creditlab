@@ -115,6 +115,22 @@ _, panel, _ = synth.generate()
 a = synth.plot_volume_bad_rate()
 ```
 
+Para preservar a ordem natural dos grupos homogêneos durante o balanceamento,
+use ``preserve_gh_order=True``:
+
+```python
+from credit_data_sampler import TargetSampler
+sampler = TargetSampler(
+    target_ratio=0.10,
+    preserve_gh_order=True,
+    random_state=42,
+)
+panel_bal = sampler.fit_transform(panel)
+```
+
+* ``per_group=True`` força que cada GH tenha a mesma prevalência final.
+* ``preserve_gh_order=True`` apenas garante que ``bad_rate(GH_i) ≥ bad_rate(GH_{i+1})``.
+
 ---
 
 
