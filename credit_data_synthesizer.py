@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List, Tuple
+from itertools import count
 import numpy as np
 import pandas as pd
 
@@ -112,6 +113,7 @@ class GroupProfile:
         rng: np.random.Generator,
         *,
         id_offset: int = 0,
+        ids: np.ndarray | None = None,
         buckets: List[int] | None = None,
         start_safra: pd.Timestamp | None = None,
     ) -> pd.DataFrame:
@@ -120,7 +122,10 @@ class GroupProfile:
         df = pd.DataFrame(index=np.arange(n))
 
         # Identificadores
-        df["id_contrato"] = id_offset + np.arange(n, dtype="int64")
+        if ids is None:
+            df["id_contrato"] = id_offset + np.arange(n, dtype="int64")
+        else:
+            df["id_contrato"] = np.asarray(ids, dtype="int64")
         df["grupo_homogeneo"] = self.name
 
         if start_safra is None:
@@ -379,6 +384,11 @@ class CreditDataSynthesizer:
         closure_rate: float = 0.03,
         max_duration_m: int = 72,
         p_existing_client: float = 0.7,
+        id_start: int = 10_000_000,
+        id_length: int = 8,
+        sampler_strategy: str = "undersample",
+        max_sampling_iter: int = 3,
+        realloc_window: int = 3,
     ) -> None:
         self.group_profiles = group_profiles
         self.contracts_per_group = contracts_per_group
@@ -395,6 +405,12 @@ class CreditDataSynthesizer:
         self.closure_rate = closure_rate
         self.max_duration_m = max_duration_m
         self.p_existing_client = p_existing_client
+        self.id_start = id_start
+        self.id_length = id_length
+        self._id_pool = count(id_start)
+        self.sampler_strategy = sampler_strategy
+        self.max_sampling_iter = max_sampling_iter
+        self.realloc_window = realloc_window
 
         for gp in self.group_profiles:
             if gp.transition_matrix is None or gp.transition_matrix.shape[0] != len(self.buckets):
@@ -448,6 +464,19 @@ class CreditDataSynthesizer:
         )
         return df
 
+    # ------------------------------------------------------------------
+    def _next_id(self) -> int:
+        """Return next unique contract ID."""
+        nxt = next(self._id_pool)
+        if nxt >= 10 ** self.id_length:
+            raise RuntimeError("ID pool exhausted")
+        return nxt
+
+    def _next_ids(self, n: int) -> np.ndarray:
+        """Return array with ``n`` new unique contract IDs."""
+        ids = np.fromiter((self._next_id() for _ in range(n)), dtype="int64", count=n)
+        return ids
+
     # ---------------------------------------------------------------------
     # API pública
     # ---------------------------------------------------------------------
@@ -474,12 +503,11 @@ class CreditDataSynthesizer:
         start_date = self.start_safra
 
         contracts: List[pd.DataFrame] = []
-        for g_idx, gp in enumerate(self.group_profiles):
-            offset = g_idx * self.contracts_per_group
+        for gp in self.group_profiles:
             df = gp.sample_contracts(
                 self.contracts_per_group,
                 rng=self.rng,
-                id_offset=offset,
+                ids=self._next_ids(self.contracts_per_group),
                 buckets=self.buckets,
                 start_safra=start_date,
             )
@@ -541,7 +569,6 @@ class CreditDataSynthesizer:
 
         current = self._snapshot.copy()
         start_date = current["data_ref"].iloc[0]
-        self._id_counter = int(current["id_contrato"].max()) + 1
         traces: List[dict] = []
         records = [current.copy()]
         closed_recs: List[pd.DataFrame] = []
@@ -618,8 +645,7 @@ class CreditDataSynthesizer:
             # Renegociação
             for idx in sub.index[reneg_mask]:
                 old_id = int(sub.at[idx, "id_contrato"])
-                new_id = int(self._id_counter)
-                self._id_counter += 1
+                new_id = int(self._next_id())
                 trace_records.append(
                     {"id_antigo": old_id, "id_novo": new_id, "data_evento": ref_date}
                 )
@@ -670,11 +696,10 @@ class CreditDataSynthesizer:
         df = gp.sample_contracts(
             n,
             rng=self.rng,
-            id_offset=self._id_counter,
+            ids=self._next_ids(n),
             buckets=self.buckets,
             start_safra=ref_date,
         )
-        self._id_counter += n
         for idx in df.index:
             cid, birth, sexo = self._pick_client(ref_date, active_ids)
             start = ref_date - pd.to_timedelta(self.rng.integers(0, 30), unit="D")
@@ -705,6 +730,37 @@ class CreditDataSynthesizer:
         self._clients.loc[len(self._clients)] = [cid, sexo, birth]
         self._start_pairs.add((cid, key))
         return cid, birth, sexo
+
+    # ------------------------------------------------------------------
+    def _reinject(self, df: pd.DataFrame) -> None:
+        """Reallocate removed contracts into future safras."""
+        if df.empty:
+            return
+        df = df.copy()
+        max_date = self._panel["data_ref"].max()
+        for idx in df.index:
+            add_m = int(self.rng.integers(1, self.realloc_window + 1))
+            new_ref = pd.to_datetime(df.at[idx, "data_ref"]) + pd.DateOffset(months=add_m)
+            if new_ref > max_date:
+                new_ref = max_date
+            start = new_ref - pd.to_timedelta(self.rng.integers(0, 30), unit="D")
+            df.at[idx, "id_contrato"] = self._next_id()
+            df.at[idx, "data_inicio_contrato"] = start
+            df.at[idx, "data_ref"] = new_ref
+            df.at[idx, "safra"] = new_ref.strftime("%Y%m")
+            df.at[idx, "age_months"] = 0
+            df.at[idx, "dias_atraso"] = 0
+            df.at[idx, "streak_90"] = 0
+            df.at[idx, "nivel_refinanciamento"] = 0
+            df.at[idx, "num_parcelas_pagas"] = 0
+            df.at[idx, "num_parcelas_pagas_consecutivas"] = 0
+            df.at[idx, "qtd_renegociacoes"] = 0
+            df.at[idx, "data_fim_contrato"] = pd.NaT
+            df.at[idx, "ever90m12"] = 0
+            df.at[idx, "over90m12"] = 0
+            df.at[idx, "ever360m18"] = 0
+            df.at[idx, "flag_cura"] = 0
+        self._panel = pd.concat([self._panel, df], ignore_index=True)
 
     # ------------------------------------------------------------------
     def _compute_targets(self) -> None:
@@ -781,14 +837,20 @@ class CreditDataSynthesizer:
         from credit_data_sampler import TargetSampler
 
         sampler = TargetSampler(
-            target_ratio=self.target_ratio, **self._sampler_kwargs
+            target_ratio=self.target_ratio,
+            strategy=self.sampler_strategy,
+            max_iter=self.max_sampling_iter,
+            **self._sampler_kwargs,
         )
-        self._panel = sampler.fit_transform(
+        self._panel, overflow = sampler.fit_transform(
             self._panel,
             target_col="ever90m12",
             safra_col="safra",
             group_col="grupo_homogeneo",
+            random_state=self.rng.integers(0, 1_000_000),
         )
+        if not overflow.empty:
+            self._reinject(overflow)
         first_safra = self._panel["data_ref"].min()
         self._snapshot = (
             self._panel[self._panel["data_ref"] == first_safra]

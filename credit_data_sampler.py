@@ -70,6 +70,8 @@ class TargetSampler:
         tolerance_pp: float = 2.0,
         min_pos: int = 5,
         preserve_gh_order: bool | None = None,
+        strategy: str = "undersample",
+        max_iter: int = 3,
     ):
         if not 0 < target_ratio < 1:
             raise ValueError("target_ratio must be between 0 and 1 (exclusive)")
@@ -83,6 +85,10 @@ class TargetSampler:
         self.tolerance_pp = float(tolerance_pp)
         self.preserve_gh_order = self.preserve_rank  # backward compat
         self.min_pos = min_pos
+        if strategy not in {"undersample", "oversample", "hybrid"}:
+            raise ValueError("strategy must be 'undersample', 'oversample' or 'hybrid'")
+        self.strategy = strategy
+        self.max_iter = max_iter
 
     # ------------------------------------------------------------------
     def _jitter(self, df: pd.DataFrame, target_col: str, rng: np.random.Generator) -> None:
@@ -114,7 +120,7 @@ class TargetSampler:
         target_col: str,
         prev_rate: float | None,
         rng: np.random.Generator,
-    ) -> Tuple[pd.DataFrame, float]:
+    ) -> Tuple[pd.DataFrame, float, pd.DataFrame]:
         pos = grp[grp[target_col] == 1]
         neg = grp[grp[target_col] == 0]
 
@@ -128,28 +134,28 @@ class TargetSampler:
 
         if n_pos == 0 or n_neg == 0:
             rate = n_pos / (n_pos + n_neg) if (n_pos + n_neg) > 0 else 0.0
-            return grp, rate
+            return grp, rate, pd.DataFrame(columns=grp.columns)
 
         desired_neg = int(np.round(n_pos * (1 - self.target_ratio) / self.target_ratio))
-        max_neg = int(n_neg * self.max_oversample)
-        if prev_rate is not None:
-            req_neg = int(np.ceil(n_pos * (1 - prev_rate) / prev_rate)) if prev_rate > 0 else max_neg
+        if prev_rate is not None and prev_rate > 0:
+            req_neg = int(np.ceil(n_pos * (1 - prev_rate) / prev_rate))
             desired_neg = max(desired_neg, req_neg)
 
-        capped = False
-        if desired_neg > max_neg:
-            capped = True
-            desired_neg = max_neg
+        desired_neg = min(desired_neg, n_neg)
 
-        neg_bal = self._sample_negatives(neg, desired_neg, target_col, rng)
+        if desired_neg < n_neg:
+            keep_idx = rng.choice(neg.index, size=desired_neg, replace=False)
+            removed = neg.drop(keep_idx)
+            neg_bal = neg.loc[keep_idx]
+        else:
+            removed = pd.DataFrame(columns=neg.columns)
+            neg_bal = neg
+
         grp_bal = pd.concat([pos, neg_bal], ignore_index=True)
         rate = len(pos) / len(grp_bal)
-        if capped and abs(rate - self.target_ratio) > self.tolerance_pp / 100:
-            import logging
-            logging.warning(
-                "Target ratio deviates %.1f pp in group", (rate - self.target_ratio) * 100
-            )
-        return grp_bal, rate
+        if abs(rate - self.target_ratio) > self.tolerance_pp / 100:
+            logging.info("Target ratio deviates %.1f pp in group", (rate - self.target_ratio) * 100)
+        return grp_bal, rate, removed
 
 
     # ------------------------------------------------------------------
@@ -163,84 +169,80 @@ class TargetSampler:
         safra_col: str = "safra",
         group_col: str = "grupo_homogeneo",
         random_state: int | None = None,
-    ) -> pd.DataFrame:
-        """Return a new DataFrame with rebalanced target prevalence por safra."""
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Return balanced panel and overflow DataFrame."""
         rng = np.random.default_rng(random_state)
-        pieces: List[pd.DataFrame] = []
+        df = panel.copy()
+        overflow: List[pd.DataFrame] = []
 
-        if self.preserve_rank:
-            for safra, df_safra in panel.groupby(safra_col, sort=False):
-                order = (
-                    df_safra.groupby(group_col)[target_col]
-                    .mean()
-                    .sort_values(ascending=False)
-                    .index
-                )
-                prev = None
-                bal_groups: List[pd.DataFrame] = []
-                for gh in order:
-                    grp = df_safra[df_safra[group_col] == gh]
-                    bal, prev = self._balance_group_monotone(
-                        grp,
-                        target_col=target_col,
-                        prev_rate=prev,
-                        rng=rng,
+        for _ in range(self.max_iter):
+            pieces: List[pd.DataFrame] = []
+            for safra, df_safra in df.groupby(safra_col, sort=False):
+                if self.preserve_rank:
+                    order = (
+                        df_safra.groupby(group_col)[target_col]
+                        .mean()
+                        .sort_values(ascending=False)
+                        .index
                     )
-                    bal_groups.append(bal)
-                cat = pd.CategoricalDtype(order, ordered=True)
-                for df_b in bal_groups:
-                    df_b[group_col] = df_b[group_col].astype(cat)
-                df_bal = pd.concat(bal_groups, ignore_index=True).sort_values(group_col)
-                pieces.append(df_bal)
-        else:
-            group_keys = [safra_col]
-            if self.per_group:
-                group_keys.append(group_col)
-
-            for _, grp in panel.groupby(group_keys, sort=False):
-                pos = grp[grp[target_col] == 1]
-                neg = grp[grp[target_col] == 0]
-
-                n_pos = len(pos)
-                n_neg = len(neg)
-
-                if n_pos < self.min_pos and n_pos > 0:
-                    extra = pos.sample(
-                        self.min_pos - n_pos,
-                        replace=True,
-                        random_state=rng.integers(0, 1_000_000),
+                    prev = None
+                    bal_groups: List[pd.DataFrame] = []
+                    for gh in order:
+                        grp = df_safra[df_safra[group_col] == gh]
+                        bal, prev, rem = self._balance_group_monotone(
+                            grp,
+                            target_col=target_col,
+                            prev_rate=prev,
+                            rng=rng,
+                        )
+                        bal_groups.append(bal)
+                        if not rem.empty:
+                            overflow.append(rem)
+                    cat = pd.CategoricalDtype(order, ordered=True)
+                    for df_b in bal_groups:
+                        df_b[group_col] = df_b[group_col].astype(cat)
+                    df_bal = (
+                        pd.concat(bal_groups, ignore_index=True)
+                        .sort_values(group_col)
                     )
-                    self._jitter(extra, target_col, rng)
-                    pos = pd.concat([pos, extra], ignore_index=True)
-                    n_pos = len(pos)
-
-                if n_pos == 0 or n_neg == 0:
-                    pieces.append(grp)
-                    continue
-
-                if self.keep_positives:
-                    new_neg_n = int(n_pos * (1 - self.target_ratio) / self.target_ratio)
-                    neg = self._sample_negatives(neg, new_neg_n, target_col, rng)
-                    grp_bal = pd.concat([pos, neg], ignore_index=True)
+                    pieces.append(df_bal)
                 else:
-                    total_desired = int(n_pos + n_neg)
-                    n_pos_desired = int(total_desired * self.target_ratio)
-                    n_neg_desired = total_desired - n_pos_desired
-                    if n_pos > n_pos_desired:
-                        pos_idx = rng.choice(pos.index, size=n_pos_desired, replace=False)
-                        pos = pos.loc[pos_idx]
-                    if n_neg > n_neg_desired:
-                        neg_idx = rng.choice(neg.index, size=n_neg_desired, replace=False)
-                        neg = neg.loc[neg_idx]
-                    grp_bal = pd.concat([pos, neg], ignore_index=True)
+                    groups = (
+                        df_safra.groupby(group_col, sort=False)
+                        if self.per_group
+                        else [(None, df_safra)]
+                    )
+                    for _, grp_df in groups:
+                        pos = grp_df[grp_df[target_col] == 1]
+                        neg = grp_df[grp_df[target_col] == 0]
+                        n_pos = len(pos)
+                        n_neg = len(neg)
+                        if n_pos < self.min_pos and n_pos > 0:
+                            extra = pos.sample(self.min_pos - n_pos, replace=True, random_state=rng.integers(0, 1_000_000))
+                            self._jitter(extra, target_col, rng)
+                            pos = pd.concat([pos, extra], ignore_index=True)
+                            n_pos = len(pos)
+                        if n_pos == 0 or n_neg == 0:
+                            pieces.append(grp_df)
+                            continue
+                        desired_neg = int(round(n_pos * (1 - self.target_ratio) / self.target_ratio))
+                        if desired_neg < n_neg:
+                            keep_idx = rng.choice(neg.index, size=desired_neg, replace=False)
+                            overflow.append(neg.drop(keep_idx))
+                            neg = neg.loc[keep_idx]
+                        grp_bal = pd.concat([pos, neg], ignore_index=True)
+                        pieces.append(grp_bal)
 
-                pieces.append(grp_bal)
+            new_df = pd.concat(pieces, ignore_index=True)
+            rates = new_df.groupby(safra_col)[target_col].mean()
+            if (rates - self.target_ratio).abs().max() < self.tolerance_pp / 100:
+                df = new_df
+                break
+            df = new_df
 
-        balanced = pd.concat(pieces, ignore_index=True)
-        # reorder rows by original order of safras to keep panel temporality
-        balanced = balanced.sort_values([safra_col, "id_contrato", "data_ref"], kind="mergesort")
-        balanced.reset_index(drop=True, inplace=True)
-        return balanced
+        balanced = df.sort_values([safra_col, "id_contrato", "data_ref"], kind="mergesort").reset_index(drop=True)
+        overflow_df = pd.concat(overflow, ignore_index=True) if overflow else pd.DataFrame(columns=panel.columns)
+        return balanced, overflow_df
 
 
 # ----------------------------------------------------------------------
