@@ -58,7 +58,7 @@ class TargetSampler:
         *,
         keep_positives: bool = True,
         per_group: bool = False,
-        preserve_gh_order: bool = False,
+        preserve_gh_order: bool = True,
         min_pos: int = 5,
     ):
         if not 0 < target_ratio < 1:
