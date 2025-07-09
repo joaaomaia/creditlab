@@ -29,7 +29,8 @@ from typing import Tuple, List
 import warnings
 import logging
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("creditlab.sampler")
+logger.setLevel(logging.INFO)
 
 __all__ = ["TargetSampler"]
 
@@ -93,6 +94,11 @@ class TargetSampler:
         self.strategy = strategy
         self.max_iter = max_iter
         self.tol_pp = float(tol_pp)
+        self.logger = logger.getChild(self.__class__.__name__)
+
+    # ------------------------------------------------------------------
+    def _log(self, msg: str, *args, lvl: int = logging.INFO) -> None:
+        self.logger.log(lvl, msg, *args)  # verbose handled via logging level
 
     # ------------------------------------------------------------------
     def _jitter(self, df: pd.DataFrame, target_col: str, rng: np.random.Generator) -> None:
@@ -177,6 +183,7 @@ class TargetSampler:
         """Return balanced panel and overflow DataFrame."""
         rng = np.random.default_rng(random_state)
         df = panel.copy()
+        before = df.groupby([safra_col, group_col])[target_col].mean()
         overflow: List[pd.DataFrame] = []
 
         for _ in range(self.max_iter):
@@ -244,9 +251,11 @@ class TargetSampler:
                 break
             df = new_df
 
-        final_rates = df.groupby(safra_col)[target_col].mean()
-        if (final_rates - self.target_ratio).abs().max() > self.tol_pp / 100:
-            logger.warning("Unable to reach target ratio within %.1f pp", self.tol_pp)
+        final_rates = df.groupby([safra_col, group_col])[target_col].mean()
+        delta = (final_rates - before).round(4)
+        self._log("sampling \u0394pp %s", delta.to_dict())
+        if (final_rates.groupby(level=0).mean() - self.target_ratio).abs().max() > self.tol_pp / 100:
+            self.logger.warning("Unable to reach target ratio within %.1f pp", self.tol_pp)
 
         balanced = df.sort_values([safra_col, "id_contrato", "data_ref"], kind="mergesort").reset_index(drop=True)
         overflow_df = pd.concat(overflow, ignore_index=True) if overflow else pd.DataFrame(columns=panel.columns)
