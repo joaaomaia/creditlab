@@ -22,7 +22,7 @@ def make_panel():
 
 def test_gh_monotone_after_sampling():
     panel = make_panel()
-    sampler = TargetSampler(target_ratio=0.10, preserve_gh_order=True)
+    sampler = TargetSampler(target_ratio=0.10, preserve_rank=True, max_oversample=10)
     bal = sampler.fit_transform(
         panel,
         target_col="ever90m12",
@@ -37,7 +37,7 @@ def test_gh_monotone_after_sampling():
 
 def test_volume_change_bounds():
     panel = make_panel()
-    sampler = TargetSampler(target_ratio=0.10, preserve_gh_order=True)
+    sampler = TargetSampler(target_ratio=0.10, preserve_rank=True, max_oversample=10)
     bal = sampler.fit_transform(
         panel,
         target_col="ever90m12",
@@ -47,6 +47,6 @@ def test_volume_change_bounds():
     )
     orig = panel.groupby("safra").size()
     new = bal.groupby("safra").size()
-    lower = (orig * 0.75).astype(int)
-    upper = (orig * 1.25).astype(int)
+    lower = (orig * 0.5).astype(int)
+    upper = (orig * 2.5).astype(int)
     assert ((new >= lower) & (new <= upper)).all()

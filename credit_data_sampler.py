@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 from typing import Tuple, List
 import warnings
+import logging
 
 __all__ = ["TargetSampler"]
 
@@ -44,10 +45,16 @@ class TargetSampler:
         conforme necessário).
     per_group : bool, default False
         Se True, aplica balanceamento dentro de cada ``grupo_homogeneo`` e safra.
-    preserve_gh_order : bool, default False
+    preserve_rank : bool, default True
         Mantém a ordenação de risco dos grupos homogêneos após o sampling.
-        ``per_group`` força o balanceamento individual; já ``preserve_gh_order``
-        apenas garante monotonicidade nas bad-rates.
+        ``per_group`` força o balanceamento individual; ``preserve_rank`` apenas
+        garante monotonicidade nas bad-rates.
+    max_oversample : float, default 2.0
+        Fator máximo de replicação permitido para negativos quando
+        ``preserve_rank`` está ativo.
+    tolerance_pp : float, default 2.0
+        Desvio tolerado (em pontos‑percentuais) entre ``target_ratio`` e o valor
+        atingido quando o oversampling é limitado.
     min_pos : int, default 5
         Número mínimo de positivos por grupo antes do downsample (com oversampling).
     """
@@ -58,15 +65,23 @@ class TargetSampler:
         *,
         keep_positives: bool = True,
         per_group: bool = False,
-        preserve_gh_order: bool = True,
+        preserve_rank: bool | None = None,
+        max_oversample: float = 2.0,
+        tolerance_pp: float = 2.0,
         min_pos: int = 5,
+        preserve_gh_order: bool | None = None,
     ):
         if not 0 < target_ratio < 1:
             raise ValueError("target_ratio must be between 0 and 1 (exclusive)")
         self.target_ratio = target_ratio
         self.keep_positives = keep_positives
         self.per_group = per_group
-        self.preserve_gh_order = preserve_gh_order
+        if preserve_rank is None and preserve_gh_order is not None:
+            preserve_rank = preserve_gh_order
+        self.preserve_rank = True if preserve_rank is None else bool(preserve_rank)
+        self.max_oversample = float(max_oversample)
+        self.tolerance_pp = float(tolerance_pp)
+        self.preserve_gh_order = self.preserve_rank  # backward compat
         self.min_pos = min_pos
 
     # ------------------------------------------------------------------
@@ -116,21 +131,24 @@ class TargetSampler:
             return grp, rate
 
         desired_neg = int(np.round(n_pos * (1 - self.target_ratio) / self.target_ratio))
-        max_neg = int(n_neg * 1.2)
+        max_neg = int(n_neg * self.max_oversample)
         if prev_rate is not None:
             req_neg = int(np.ceil(n_pos * (1 - prev_rate) / prev_rate)) if prev_rate > 0 else max_neg
             desired_neg = max(desired_neg, req_neg)
 
+        capped = False
         if desired_neg > max_neg:
-            warnings.warn(
-                "Unable to fully preserve GH order; limiting negative oversampling.",
-                RuntimeWarning,
-            )
+            capped = True
             desired_neg = max_neg
 
         neg_bal = self._sample_negatives(neg, desired_neg, target_col, rng)
         grp_bal = pd.concat([pos, neg_bal], ignore_index=True)
         rate = len(pos) / len(grp_bal)
+        if capped and abs(rate - self.target_ratio) > self.tolerance_pp / 100:
+            import logging
+            logging.warning(
+                "Target ratio deviates %.1f pp in group", (rate - self.target_ratio) * 100
+            )
         return grp_bal, rate
 
 
@@ -150,7 +168,7 @@ class TargetSampler:
         rng = np.random.default_rng(random_state)
         pieces: List[pd.DataFrame] = []
 
-        if self.preserve_gh_order:
+        if self.preserve_rank:
             for safra, df_safra in panel.groupby(safra_col, sort=False):
                 order = (
                     df_safra.groupby(group_col)[target_col]
@@ -159,6 +177,7 @@ class TargetSampler:
                     .index
                 )
                 prev = None
+                bal_groups: List[pd.DataFrame] = []
                 for gh in order:
                     grp = df_safra[df_safra[group_col] == gh]
                     bal, prev = self._balance_group_monotone(
@@ -167,7 +186,12 @@ class TargetSampler:
                         prev_rate=prev,
                         rng=rng,
                     )
-                    pieces.append(bal)
+                    bal_groups.append(bal)
+                cat = pd.CategoricalDtype(order, ordered=True)
+                for df_b in bal_groups:
+                    df_b[group_col] = df_b[group_col].astype(cat)
+                df_bal = pd.concat(bal_groups, ignore_index=True).sort_values(group_col)
+                pieces.append(df_bal)
         else:
             group_keys = [safra_col]
             if self.per_group:

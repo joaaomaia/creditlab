@@ -115,21 +115,36 @@ _, panel, _ = synth.generate()
 a = synth.plot_volume_bad_rate()
 ```
 
+Carteiras dinâmicas podem ser simuladas controlando entrada e saída de contratos:
+
+```python
+synth = CreditDataSynthesizer(
+    group_profiles=default_group_profiles(2),
+    contracts_per_group=200,
+    n_safras=24,
+    new_contract_rate=0.05,
+    closure_rate=0.03,
+    max_duration_m=72,
+)
+```
+
 Para preservar a ordem natural dos grupos homogêneos durante o balanceamento,
-use ``preserve_gh_order=True``:
+use ``preserve_rank=True``:
 
 ```python
 from credit_data_sampler import TargetSampler
 sampler = TargetSampler(
-    target_ratio=0.10,
-    preserve_gh_order=True,
+    target_ratio=0.08,
+    preserve_rank=True,
+    max_oversample=2.0,
+    tolerance_pp=2,
     random_state=42,
 )
 panel_bal = sampler.fit_transform(panel)
 ```
 
 * ``per_group=True`` força que cada GH tenha a mesma prevalência final.
-* ``preserve_gh_order=True`` apenas garante que ``bad_rate(GH_i) ≥ bad_rate(GH_{i+1})``.
+* ``preserve_rank=True`` apenas garante que ``bad_rate(GH_i) ≥ bad_rate(GH_{i+1})``.
 
 ---
 
