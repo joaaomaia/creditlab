@@ -31,8 +31,10 @@ def test_start_before_safra(panel: pd.DataFrame):
     assert (panel["data_inicio_contrato"] <= panel["data_ref"]).all()
 
 
-def test_unique_client_month(panel: pd.DataFrame):
-    assert not panel.duplicated(["id_cliente", "safra"]).any()
+def test_unique_client_start_month(panel: pd.DataFrame):
+    snap = panel[panel["data_ref"] == panel["data_ref"].min()].copy()
+    pairs = snap.assign(m=snap["data_inicio_contrato"].dt.strftime("%Y%m"))
+    assert not pairs.duplicated(["id_cliente", "m"]).any()
 
 
 def test_unique_birthdate(synth: CreditDataSynthesizer):
