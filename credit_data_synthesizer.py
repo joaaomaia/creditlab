@@ -61,6 +61,9 @@ import warnings
 import logging
 warnings.simplefilter(action='ignore', category=pd.errors.SettingWithCopyWarning)
 
+logger = logging.getLogger("creditlab.synth")
+logger.setLevel(logging.INFO)
+
 # =============================================================================
 # GroupProfile
 # =============================================================================
@@ -419,7 +422,7 @@ class CreditDataSynthesizer:
         self.max_simultaneous_contracts = max_simultaneous_contracts
         self.max_recompute_iter = max_recompute_iter
         self.verbose = verbose
-        self.logger = logging.getLogger(self.__class__.__name__)
+        self.logger = logger.getChild(self.__class__.__name__)
 
         for gp in self.group_profiles:
             if gp.transition_matrix is None or gp.transition_matrix.shape[0] != len(self.buckets):
@@ -456,6 +459,11 @@ class CreditDataSynthesizer:
         self._closed: pd.DataFrame | None = None
 
         self._next_client_id = int(self._clients["id_cliente"].max()) + 1
+
+    # ------------------------------------------------------------------
+    def _log(self, msg: str, *args, lvl: int = logging.INFO) -> None:
+        if self.verbose:
+            self.logger.log(lvl, msg, *args)
 
     # ------------------------------------------------------------------
     def _build_clients(self, n_clients: int) -> pd.DataFrame:
@@ -513,6 +521,8 @@ class CreditDataSynthesizer:
         start_date = self.start_safra
 
         contracts: List[pd.DataFrame] = []
+        new_clients = 0
+        reused_clients = 0
         for gp in self.group_profiles:
             df = gp.sample_contracts(
                 self.contracts_per_group,
@@ -528,8 +538,12 @@ class CreditDataSynthesizer:
                 df.at[df.index[0], "dias_atraso"] = 30
 
             contracts.append(df)
-            if self.verbose:
-                self.logger.info("Snapshot %s rows=%d", gp.name, len(df))
+            self._log(
+                "snapshot %s rows=%d pos=%.1f%%",
+                gp.name,
+                len(df),
+                df["ever90m12"].mean() * 100,
+            )
 
         client_counts: dict[int, int] = {}
         client_delay: dict[int, int] = {}
@@ -546,6 +560,10 @@ class CreditDataSynthesizer:
                 else:
                     raise RuntimeError("Not enough clients for concurrent contracts")
 
+                if client_counts.get(cid, 0) == 0:
+                    new_clients += 1
+                else:
+                    reused_clients += 1
                 client_counts[cid] = client_counts.get(cid, 0) + 1
                 start = random_contract_start(start_date, self.rng)
                 while (cid, start.strftime("%Y%m")) in self._start_pairs:
@@ -590,6 +608,7 @@ class CreditDataSynthesizer:
             records.append(df)
 
         self._snapshot = pd.concat(records, ignore_index=True, copy=False)
+        self._log("snapshot clients new=%d reused=%d", new_clients, reused_clients)
 
     # ------------------------------------------------------------------
     # Passo 2: evolução mensal
@@ -605,20 +624,18 @@ class CreditDataSynthesizer:
 
         for m in range(1, self.n_safras):
             ref_date = start_date + pd.DateOffset(months=m)
-            panel_month, current = self._evolve_one_month(current, ref_date, traces)
+            panel_month, current, stats = self._evolve_one_month(current, ref_date, traces)
             records.append(panel_month.copy())
             closed_recs.append(panel_month[panel_month["data_fim_contrato"].notna()].copy())
-            if self.verbose:
-                defaults = (
-                    panel_month[panel_month["dias_atraso"] >= 90]
-                    .groupby("grupo_homogeneo")["id_contrato"]
-                    .nunique()
-                )
-                self.logger.info(
-                    "%s defaults %s",
-                    ref_date.strftime("%Y-%m"),
-                    defaults.to_dict(),
-                )
+            monthly_rate = panel_month["ever90m12"].mean() * 100
+            self._log(
+                "%s summary: rows=%d new=%d closed=%d bad=%.1f%%",
+                ref_date.strftime("%Y-%m"),
+                len(panel_month),
+                sum(s["new"] for s in stats.values()),
+                sum(s["closed"] for s in stats.values()),
+                monthly_rate,
+            )
 
         self._panel = pd.concat(records, ignore_index=True)
         self._closed = pd.concat(closed_recs, ignore_index=True) if closed_recs else pd.DataFrame()
@@ -630,10 +647,11 @@ class CreditDataSynthesizer:
         df: pd.DataFrame,
         ref_date: pd.Timestamp,
         trace_records: List[dict],
-    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, dict]:
         df = df.copy()
         buckets = np.array(self.buckets, dtype=np.int16)
         n_buckets = len(buckets)
+        stats = {gp.name: {"new": 0, "closed": 0, "defaults": 0} for gp in self.group_profiles}
         df["age_months"] += 1
         for gp in self.group_profiles:
             mask = df["grupo_homogeneo"] == gp.name
@@ -662,6 +680,7 @@ class CreditDataSynthesizer:
             streak_90 = np.where(new_delay == 90, prev_streak90 + 1, 0)
             trigger2 = (streak_90 >= 3) & (new_delay == 90)
             reneg_mask = trigger1 | trigger2
+            stats[gp.name]["defaults"] = int((new_delay >= 90).sum())
 
             # atualiza atraso e contadores
             sub["dias_atraso"] = new_delay
@@ -712,6 +731,9 @@ class CreditDataSynthesizer:
         df.loc[close_mask, "data_fim_contrato"] = ref_date
         open_df = df[~close_mask].copy()
         closed_ids = set(df.loc[close_mask, "id_cliente"].astype(int))
+        for gp in self.group_profiles:
+            mask = df["grupo_homogeneo"] == gp.name
+            stats[gp.name]["closed"] = int(close_mask[mask].sum())
 
         # spawn new contracts -------------------------------------------------
         new_list = []
@@ -722,7 +744,9 @@ class CreditDataSynthesizer:
                 n_new = max(n_new, 1)
             if n_new > 0:
                 active = set(open_df["id_cliente"].astype(int)).union(closed_ids)
-                new_list.append(self._spawn_new_contracts(gp, n_new, ref_date, active))
+                new_df = self._spawn_new_contracts(gp, n_new, ref_date, active)
+                new_list.append(new_df)
+                stats[gp.name]["new"] = len(new_df)
         if new_list:
             open_df = pd.concat([open_df] + new_list, ignore_index=True)
 
@@ -731,7 +755,21 @@ class CreditDataSynthesizer:
         panel_df["safra"] = ref_date.strftime("%Y%m")
         open_df["data_ref"] = ref_date
         open_df["safra"] = ref_date.strftime("%Y%m")
-        return panel_df, open_df
+        for gp in self.group_profiles:
+            mask = panel_df["grupo_homogeneo"] == gp.name
+            size = mask.sum()
+            defaults = stats[gp.name]["defaults"]
+            bad = defaults / size * 100 if size > 0 else 0.0
+            self._log(
+                "%s GH=%s new=%d closed=%d defaults=%d bad_rate=%.1f%%",
+                ref_date.strftime("%Y-%m"),
+                gp.name,
+                stats[gp.name]["new"],
+                stats[gp.name]["closed"],
+                defaults,
+                bad,
+            )
+        return panel_df, open_df, stats
 
     def _spawn_new_contracts(
         self, gp: GroupProfile, n: int, ref_date: pd.Timestamp, active_ids: set[int]
@@ -888,8 +926,8 @@ class CreditDataSynthesizer:
             **self._sampler_kwargs,
         )
         if self.verbose:
-            prev = self._panel.groupby("safra")["ever90m12"].mean()
-            self.logger.info("Sampling before %s", prev.to_dict())
+            before = self._panel.groupby(["safra", "grupo_homogeneo"])["ever90m12"].mean()
+            self._log("sampling before %s", before.round(4).to_dict())
         self._panel, overflow = sampler.fit_transform(
             self._panel,
             target_col="ever90m12",
@@ -898,10 +936,11 @@ class CreditDataSynthesizer:
             random_state=self.rng.integers(0, 1_000_000),
         )
         if self.verbose:
-            after = self._panel.groupby("safra")["ever90m12"].mean()
-            self.logger.info("Sampling after %s", after.to_dict())
+            after = self._panel.groupby(["safra", "grupo_homogeneo"])["ever90m12"].mean()
+            self._log("sampling \u0394pp %s", (after - before).round(4).to_dict())
         if not overflow.empty:
             self._reinject(overflow)
+            self._log("overflow=%d reinjected=%d", len(overflow), len(overflow))
         first_safra = self._panel["data_ref"].min()
         self._snapshot = (
             self._panel[self._panel["data_ref"] == first_safra]
@@ -910,7 +949,7 @@ class CreditDataSynthesizer:
         )
 
     def _recompute_targets_post_sampling(self) -> None:
-        for _ in range(self.max_recompute_iter):
+        for it in range(1, self.max_recompute_iter + 1):
             assert self._panel is not None
             panel = self._panel.sort_values(["id_contrato", "data_ref"])  # type: ignore[assignment]
             ever = np.zeros(len(panel), dtype="int8")
@@ -983,10 +1022,16 @@ class CreditDataSynthesizer:
                 random_state=self.rng.integers(0, 1_000_000),
             )
             if new_panel.equals(self._panel):
+                final_rates = new_panel.groupby("safra")["ever90m12"].mean()
+                diff = (final_rates - self.target_ratio).abs().max() * 100
+                self._log("recompute %d: max_pp=%.2f", it, diff)
                 break
             self._panel = new_panel
             if not overflow.empty:
                 self._reinject(overflow)
+            final_rates = self._panel.groupby("safra")["ever90m12"].mean()
+            diff = (final_rates - self.target_ratio).abs().max() * 100
+            self._log("recompute %d: max_pp=%.2f", it, diff)
 
         first_safra = self._panel["data_ref"].min()
         self._snapshot = (
@@ -994,6 +1039,13 @@ class CreditDataSynthesizer:
             .copy()
             .reset_index(drop=True)
         )
+        final_rates = self._panel.groupby("safra")["ever90m12"].mean()
+        diff = (final_rates - self.target_ratio).abs().max() * 100
+        if diff > self._sampler_kwargs.get("tol_pp", 0.5):
+            self.logger.warning(
+                "Unable to reach target ratio within %.1f pp",
+                self._sampler_kwargs.get("tol_pp", 0.5),
+            )
         if self.verbose:
             order = self._panel.groupby("grupo_homogeneo")["ever90m12"].mean().to_dict()
             self.logger.info("Bad-rate order %s", order)
@@ -1055,6 +1107,17 @@ class CreditDataSynthesizer:
     @property
     def clients(self) -> pd.DataFrame:
         return self._clients.copy()
+
+    # ------------------------------------------------------------------
+    def summary_by_safra(self) -> pd.DataFrame:
+        return self._panel.groupby("safra").agg(
+            vol=("id_contrato", "nunique"), bad=("ever90m12", "mean")
+        )
+
+    def summary_by_gh(self) -> pd.DataFrame:
+        return self._panel.groupby("grupo_homogeneo").agg(
+            vol=("id_contrato", "nunique"), bad=("ever90m12", "mean")
+        )
 
 
 # ###############################################################################
