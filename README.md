@@ -140,7 +140,15 @@ sampler = TargetSampler(
     tolerance_pp=2,
     random_state=42,
 )
-panel_bal = sampler.fit_transform(panel)
+panel_bal, overflow = sampler.fit_transform(panel)
+```
+
+Remoções de negativos são realocadas automaticamente para as próximas safras,
+mantendo o volume quase constante. Para exibir o identificador com zeros à
+esquerda:
+
+```python
+df['id_contrato'].astype(str).str.zfill(8)
 ```
 
 * ``per_group=True`` força que cada GH tenha a mesma prevalência final.
