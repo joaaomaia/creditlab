@@ -58,6 +58,7 @@ for i in range(5, 9):
     BASE_9x9[i, i] = 0.65
 
 import warnings
+import logging
 warnings.simplefilter(action='ignore', category=pd.errors.SettingWithCopyWarning)
 
 # =============================================================================
@@ -70,8 +71,8 @@ class GroupProfile:
 
     name: str
     pd_base: float  # PD 12m baseline (pior grupo ≈ 0.12, melhor ≈ 0.02)
-    refin_prob: float  # probabilidade de aceitar refinanciamento quando elegível
-    reneg_prob_exog: float  # prob mensal de renegociação exógena (fora trigger 90d)
+    p_accept_refin: float = 0.5  # probabilidade de aceitar refin após elegibilidade
+    reneg_prob_exog: float = 0.1  # prob mensal de renegociação exógena (fora trigger 90d)
     transition_matrix: np.ndarray | None = None  # matriz de transição
     num_clients: int | None = None  # numero de clientes distintos no grupo
 
@@ -325,13 +326,12 @@ def default_group_profiles(n_groups: int) -> List[GroupProfile]:
     for i in range(n_groups):
         interp = i / (n_groups - 1) if n_groups > 1 else 0  # 0…1
         pd_base = worst_pd - interp * (worst_pd - best_pd)
-        refin_prob = 0.15 + interp * 0.15  # bons clientes refinanciam mais
         reneg_prob = 0.15 - interp * 0.10  # piores renegociam mais
         profiles.append(
             GroupProfile(
                 name=f"GH{i+1}",
                 pd_base=pd_base,
-                refin_prob=refin_prob,
+                p_accept_refin=0.5,
                 reneg_prob_exog=reneg_prob,
             )
         )
@@ -389,6 +389,10 @@ class CreditDataSynthesizer:
         sampler_strategy: str = "undersample",
         max_sampling_iter: int = 3,
         realloc_window: int = 3,
+        tol_pp: float = 0.5,
+        max_simultaneous_contracts: int = 3,
+        max_recompute_iter: int = 2,
+        verbose: bool = False,
     ) -> None:
         self.group_profiles = group_profiles
         self.contracts_per_group = contracts_per_group
@@ -401,6 +405,7 @@ class CreditDataSynthesizer:
         self.force_event_rate = force_event_rate
         self.target_ratio = target_ratio
         self._sampler_kwargs = sampler_kwargs or {}
+        self._sampler_kwargs.setdefault("tol_pp", tol_pp)
         self.new_contract_rate = new_contract_rate
         self.closure_rate = closure_rate
         self.max_duration_m = max_duration_m
@@ -411,6 +416,10 @@ class CreditDataSynthesizer:
         self.sampler_strategy = sampler_strategy
         self.max_sampling_iter = max_sampling_iter
         self.realloc_window = realloc_window
+        self.max_simultaneous_contracts = max_simultaneous_contracts
+        self.max_recompute_iter = max_recompute_iter
+        self.verbose = verbose
+        self.logger = logging.getLogger(self.__class__.__name__)
 
         for gp in self.group_profiles:
             if gp.transition_matrix is None or gp.transition_matrix.shape[0] != len(self.buckets):
@@ -493,6 +502,7 @@ class CreditDataSynthesizer:
         self._generate_panel()
         self._compute_targets()
         self._apply_sampling()
+        self._recompute_targets_post_sampling()
         return self._snapshot, self._panel, self._trace
 
     # ------------------------------------------------------------------
@@ -518,19 +528,39 @@ class CreditDataSynthesizer:
                 df.at[df.index[0], "dias_atraso"] = 30
 
             contracts.append(df)
+            if self.verbose:
+                self.logger.info("Snapshot %s rows=%d", gp.name, len(df))
 
-        total = self.contracts_per_group * len(self.group_profiles)
-        chosen = self.rng.choice(len(self._clients), size=total, replace=False)
-        client_slice = self._clients.iloc[chosen].reset_index(drop=True)
-        client_iter = client_slice.itertuples(index=False)
+        client_counts: dict[int, int] = {}
+        client_delay: dict[int, int] = {}
 
         for df in contracts:
             for idx in df.index:
-                cli = next(client_iter)
-                cid = int(cli.id_cliente)
+                # pick client respecting max_simultaneous_contracts
+                for _ in range(100):
+                    cli_idx = int(self.rng.integers(0, len(self._clients)))
+                    cli = self._clients.iloc[cli_idx]
+                    cid = int(cli.id_cliente)
+                    if client_counts.get(cid, 0) < self.max_simultaneous_contracts:
+                        break
+                else:
+                    raise RuntimeError("Not enough clients for concurrent contracts")
+
+                client_counts[cid] = client_counts.get(cid, 0) + 1
                 start = random_contract_start(start_date, self.rng)
-                pair = (cid, start.strftime("%Y%m"))
-                self._start_pairs.add(pair)
+                while (cid, start.strftime("%Y%m")) in self._start_pairs:
+                    start = random_contract_start(start_date, self.rng)
+                self._start_pairs.add((cid, start.strftime("%Y%m")))
+
+                if client_counts[cid] > 1:
+                    prev = client_delay[cid]
+                    idx_prev = bucket_index(prev, self.buckets)
+                    low = max(0, idx_prev - 1)
+                    high = min(len(self.buckets) - 1, idx_prev + 1)
+                    new_idx = int(self.rng.integers(low, high + 1))
+                    df.at[idx, "dias_atraso"] = self.buckets[new_idx]
+                client_delay[cid] = int(df.at[idx, "dias_atraso"])
+
                 df.at[idx, "data_inicio_contrato"] = start
                 df.at[idx, "id_cliente"] = cid
                 df.at[idx, "data_nascimento"] = cli.data_nascimento
@@ -578,6 +608,17 @@ class CreditDataSynthesizer:
             panel_month, current = self._evolve_one_month(current, ref_date, traces)
             records.append(panel_month.copy())
             closed_recs.append(panel_month[panel_month["data_fim_contrato"].notna()].copy())
+            if self.verbose:
+                defaults = (
+                    panel_month[panel_month["dias_atraso"] >= 90]
+                    .groupby("grupo_homogeneo")["id_contrato"]
+                    .nunique()
+                )
+                self.logger.info(
+                    "%s defaults %s",
+                    ref_date.strftime("%Y-%m"),
+                    defaults.to_dict(),
+                )
 
         self._panel = pd.concat(records, ignore_index=True)
         self._closed = pd.concat(closed_recs, ignore_index=True) if closed_recs else pd.DataFrame()
@@ -610,8 +651,14 @@ class CreditDataSynthesizer:
 
             # triggers
             prev_streak90 = sub["streak_90"].to_numpy()
-            enter_60 = (prev_delay < 60) & (new_delay >= 60)
-            trigger1 = enter_60 & (self.rng.random(len(sub)) < gp.reneg_prob_exog)
+            delay_buckets = np.array([bucket_index(d, list(buckets)) for d in new_delay], dtype=np.int16)
+            bucket_factor = np.where(
+                delay_buckets == 0,
+                0.1,
+                np.where(delay_buckets == 1, 0.3, np.where(delay_buckets == 2, 0.6, 1.0)),
+            )
+            trigger1_prob = gp.reneg_prob_exog * bucket_factor
+            trigger1 = self.rng.random(len(sub)) < trigger1_prob
             streak_90 = np.where(new_delay == 90, prev_streak90 + 1, 0)
             trigger2 = (streak_90 >= 3) & (new_delay == 90)
             reneg_mask = trigger1 | trigger2
@@ -633,11 +680,9 @@ class CreditDataSynthesizer:
             sub.loc[~on_time, "num_parcelas_pagas_consecutivas"] = 0
 
             # Refinanciamento
-            refin_mask = (
-                on_time
-                & (sub["num_parcelas_pagas_consecutivas"] >= 4)
-                & (self.rng.random(len(sub)) < gp.refin_prob)
-            )
+            elig = on_time & (sub["num_parcelas_pagas_consecutivas"] >= 4)
+            accept = self.rng.random(len(sub)) < gp.p_accept_refin
+            refin_mask = elig & accept
             sub.loc[refin_mask, "nivel_refinanciamento"] += 1
             sub.loc[refin_mask, "saldo_devedor"] *= 1.1
             sub.loc[refin_mask, "num_parcelas_pagas_consecutivas"] = 0
@@ -842,6 +887,9 @@ class CreditDataSynthesizer:
             max_iter=self.max_sampling_iter,
             **self._sampler_kwargs,
         )
+        if self.verbose:
+            prev = self._panel.groupby("safra")["ever90m12"].mean()
+            self.logger.info("Sampling before %s", prev.to_dict())
         self._panel, overflow = sampler.fit_transform(
             self._panel,
             target_col="ever90m12",
@@ -849,6 +897,9 @@ class CreditDataSynthesizer:
             group_col="grupo_homogeneo",
             random_state=self.rng.integers(0, 1_000_000),
         )
+        if self.verbose:
+            after = self._panel.groupby("safra")["ever90m12"].mean()
+            self.logger.info("Sampling after %s", after.to_dict())
         if not overflow.empty:
             self._reinject(overflow)
         first_safra = self._panel["data_ref"].min()
@@ -857,6 +908,95 @@ class CreditDataSynthesizer:
             .copy()
             .reset_index(drop=True)
         )
+
+    def _recompute_targets_post_sampling(self) -> None:
+        for _ in range(self.max_recompute_iter):
+            assert self._panel is not None
+            panel = self._panel.sort_values(["id_contrato", "data_ref"])  # type: ignore[assignment]
+            ever = np.zeros(len(panel), dtype="int8")
+            over = np.zeros(len(panel), dtype="int8")
+            ever360 = np.zeros(len(panel), dtype="int8")
+
+            idx_90 = next(i for i, b in enumerate(self.buckets) if b >= 90)
+            try:
+                idx_360 = next(i for i, b in enumerate(self.buckets) if b >= 360)
+            except StopIteration:
+                idx_360 = len(self.buckets) - 1
+            idx_30 = next(i for i, b in enumerate(self.buckets) if b >= 30)
+
+            trace_map = {row.id_antigo: pd.Timestamp(row.data_evento) for row in self._trace.itertuples()}
+
+            for cid, grp in panel.groupby("id_contrato"):
+                delays = grp["dias_atraso"].to_numpy()
+                delay_idx = np.array([bucket_index(d, self.buckets) for d in delays], dtype=int)
+                dates = pd.to_datetime(grp["data_ref"]).to_numpy()
+                idx = grp.index.to_numpy()
+                event_date = trace_map.get(cid)
+                end = grp["data_fim_contrato"].dropna()
+                end_date = pd.Timestamp(end.iloc[0]) if len(end) > 0 else None
+                for i in range(len(delays)):
+                    start = pd.Timestamp(dates[i])
+                    horizon_end_12 = start + pd.DateOffset(months=12)
+                    horizon_end_18 = start + pd.DateOffset(months=18)
+                    if end_date is not None:
+                        if end_date < horizon_end_12:
+                            horizon_end_12 = end_date
+                        if end_date < horizon_end_18:
+                            horizon_end_18 = end_date
+                    mask12 = (dates[i:] <= horizon_end_12)
+                    mask18 = (dates[i:] <= horizon_end_18)
+                    future_idx_12 = delay_idx[i:][mask12]
+                    future_idx_18 = delay_idx[i:][mask18]
+                    if (future_idx_12 >= idx_90).any() or (
+                        event_date is not None and start < event_date <= horizon_end_12
+                    ):
+                        ever[idx[i]] = 1
+
+                    idx90 = np.where(future_idx_12 >= idx_90)[0]
+                    if len(idx90) > 0:
+                        first = idx90[0]
+                        if (future_idx_12[first:] >= idx_30).all():
+                            over[idx[i]] = 1
+
+                    if (future_idx_18 >= idx_360).any():
+                        ever360[idx[i]] = 1
+
+            self._panel["ever90m12"] = ever
+            self._panel["over90m12"] = over
+            self._panel["ever360m18"] = ever360
+
+            if not self.force_event_rate:
+                break
+            from credit_data_sampler import TargetSampler
+
+            sampler = TargetSampler(
+                target_ratio=self.target_ratio,
+                strategy=self.sampler_strategy,
+                max_iter=self.max_sampling_iter,
+                **self._sampler_kwargs,
+            )
+            new_panel, overflow = sampler.fit_transform(
+                self._panel,
+                target_col="ever90m12",
+                safra_col="safra",
+                group_col="grupo_homogeneo",
+                random_state=self.rng.integers(0, 1_000_000),
+            )
+            if new_panel.equals(self._panel):
+                break
+            self._panel = new_panel
+            if not overflow.empty:
+                self._reinject(overflow)
+
+        first_safra = self._panel["data_ref"].min()
+        self._snapshot = (
+            self._panel[self._panel["data_ref"] == first_safra]
+            .copy()
+            .reset_index(drop=True)
+        )
+        if self.verbose:
+            order = self._panel.groupby("grupo_homogeneo")["ever90m12"].mean().to_dict()
+            self.logger.info("Bad-rate order %s", order)
 
     def plot_volume_bad_rate(
         self,

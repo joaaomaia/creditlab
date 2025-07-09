@@ -24,10 +24,11 @@ def test_start_leq_dataref():
     assert (panel["data_inicio_contrato"] <= panel["data_ref"]).all()
 
 
-def test_one_active_contract_per_client():
+def test_start_month_unique_per_contract():
     synth = make_synth()
-    _, panel, _ = synth.generate()
-    assert not panel.duplicated(["id_cliente", "safra"]).any()
+    snap, _, _ = synth.generate()
+    pairs = snap.assign(m=snap["data_inicio_contrato"].dt.strftime("%Y%m"))
+    assert not pairs.duplicated(["id_cliente", "m"]).any()
 
 
 def test_preserve_rank_after_sampling():

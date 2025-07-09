@@ -29,6 +29,8 @@ from typing import Tuple, List
 import warnings
 import logging
 
+logger = logging.getLogger(__name__)
+
 __all__ = ["TargetSampler"]
 
 
@@ -72,6 +74,7 @@ class TargetSampler:
         preserve_gh_order: bool | None = None,
         strategy: str = "undersample",
         max_iter: int = 3,
+        tol_pp: float = 0.5,
     ):
         if not 0 < target_ratio < 1:
             raise ValueError("target_ratio must be between 0 and 1 (exclusive)")
@@ -89,6 +92,7 @@ class TargetSampler:
             raise ValueError("strategy must be 'undersample', 'oversample' or 'hybrid'")
         self.strategy = strategy
         self.max_iter = max_iter
+        self.tol_pp = float(tol_pp)
 
     # ------------------------------------------------------------------
     def _jitter(self, df: pd.DataFrame, target_col: str, rng: np.random.Generator) -> None:
@@ -235,10 +239,14 @@ class TargetSampler:
 
             new_df = pd.concat(pieces, ignore_index=True)
             rates = new_df.groupby(safra_col)[target_col].mean()
-            if (rates - self.target_ratio).abs().max() < self.tolerance_pp / 100:
+            if (rates - self.target_ratio).abs().max() < self.tol_pp / 100:
                 df = new_df
                 break
             df = new_df
+
+        final_rates = df.groupby(safra_col)[target_col].mean()
+        if (final_rates - self.target_ratio).abs().max() > self.tol_pp / 100:
+            logger.warning("Unable to reach target ratio within %.1f pp", self.tol_pp)
 
         balanced = df.sort_values([safra_col, "id_contrato", "data_ref"], kind="mergesort").reset_index(drop=True)
         overflow_df = pd.concat(overflow, ignore_index=True) if overflow else pd.DataFrame(columns=panel.columns)

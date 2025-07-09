@@ -106,8 +106,12 @@ synth = CreditDataSynthesizer(
     contracts_per_group=5_000,
     n_safras=36,
     force_event_rate=True,      # balance after generation
-    target_ratio=0.10,
+    target_ratio=0.08,
     buckets=[0,15,30,60,90,120,180,240,360],
+    p_accept_refin=0.5,
+    max_simultaneous_contracts=3,
+    tol_pp=0.5,
+    verbose=True,
 )
 _, panel, _ = synth.generate()
 

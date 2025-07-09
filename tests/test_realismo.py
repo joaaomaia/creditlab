@@ -20,7 +20,7 @@ def test_transition_matrix_rowsum():
 def test_targets_include_reneg():
     tm = np.zeros((5, 5))
     tm[:, 3] = 1.0
-    gp = GroupProfile(name="G", pd_base=0.12, refin_prob=0.0, reneg_prob_exog=1.0, transition_matrix=tm)
+    gp = GroupProfile(name="G", pd_base=0.12, p_accept_refin=0.0, reneg_prob_exog=1.0, transition_matrix=tm)
     synth = CreditDataSynthesizer(group_profiles=[gp], contracts_per_group=1, n_safras=3, random_seed=0, kernel_trick=False)
     snap, panel, trace = synth.generate()
     assert len(trace) > 0

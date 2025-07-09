@@ -38,7 +38,7 @@ def test_ever360():
     n = len(CUSTOM_BUCKETS)
     tm = np.zeros((n, n))
     tm[:, CUSTOM_BUCKETS.index(360)] = 1.0
-    gp = GroupProfile(name="G", pd_base=0.12, refin_prob=0.0, reneg_prob_exog=0.0, transition_matrix=tm)
+    gp = GroupProfile(name="G", pd_base=0.12, p_accept_refin=0.0, reneg_prob_exog=0.0, transition_matrix=tm)
     synth = CreditDataSynthesizer(
         group_profiles=[gp],
         contracts_per_group=1,
