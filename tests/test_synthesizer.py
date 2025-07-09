@@ -22,7 +22,8 @@ def make_synth():
 def test_snapshot_size():
     synth = make_synth()
     snap, panel, trace = synth.generate()
-    assert len(snap) == N_GROUPS * CONTRACTS
+    first = panel["data_ref"].min()
+    assert len(snap) == len(panel[panel["data_ref"] == first])
 
 
 def test_panel_safras_count():

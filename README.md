@@ -98,6 +98,23 @@ synth = CreditDataSynthesizer(
 )
 ```
 
+## Balanced Sampling & Monitoring
+
+```python
+synth = CreditDataSynthesizer(
+    group_profiles=default_group_profiles(4),
+    contracts_per_group=5_000,
+    n_safras=36,
+    force_event_rate=True,      # balance after generation
+    target_ratio=0.10,
+    buckets=[0,15,30,60,90,120,180,240,360],
+)
+_, panel, _ = synth.generate()
+
+# quick QA plot
+a = synth.plot_volume_bad_rate()
+```
+
 ---
 
 
