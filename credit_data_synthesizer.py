@@ -375,6 +375,10 @@ class CreditDataSynthesizer:
         target_ratio: float = 0.10,
         sampler_kwargs: dict | None = None,
         n_clients: int | None = None,
+        new_contract_rate: float = 0.05,
+        closure_rate: float = 0.03,
+        max_duration_m: int = 72,
+        p_existing_client: float = 0.7,
     ) -> None:
         self.group_profiles = group_profiles
         self.contracts_per_group = contracts_per_group
@@ -387,6 +391,10 @@ class CreditDataSynthesizer:
         self.force_event_rate = force_event_rate
         self.target_ratio = target_ratio
         self._sampler_kwargs = sampler_kwargs or {}
+        self.new_contract_rate = new_contract_rate
+        self.closure_rate = closure_rate
+        self.max_duration_m = max_duration_m
+        self.p_existing_client = p_existing_client
 
         for gp in self.group_profiles:
             if gp.transition_matrix is None or gp.transition_matrix.shape[0] != len(self.buckets):
@@ -420,6 +428,9 @@ class CreditDataSynthesizer:
         self._snapshot: pd.DataFrame | None = None
         self._panel: pd.DataFrame | None = None
         self._trace: pd.DataFrame | None = None
+        self._closed: pd.DataFrame | None = None
+
+        self._next_client_id = int(self._clients["id_cliente"].max()) + 1
 
     # ------------------------------------------------------------------
     def _build_clients(self, n_clients: int) -> pd.DataFrame:
@@ -496,6 +507,9 @@ class CreditDataSynthesizer:
                 df.at[idx, "id_cliente"] = cid
                 df.at[idx, "data_nascimento"] = cli.data_nascimento
                 df.at[idx, "sexo"] = cli.sexo
+                df.at[idx, "duration_m"] = self.rng.integers(6, self.max_duration_m + 1)
+                df.at[idx, "age_months"] = 0
+                df.at[idx, "data_fim_contrato"] = pd.NaT
 
             df["data_ref"] = start_date
             df["safra"] = start_date.strftime("%Y%m")
@@ -530,13 +544,16 @@ class CreditDataSynthesizer:
         self._id_counter = int(current["id_contrato"].max()) + 1
         traces: List[dict] = []
         records = [current.copy()]
+        closed_recs: List[pd.DataFrame] = []
 
         for m in range(1, self.n_safras):
             ref_date = start_date + pd.DateOffset(months=m)
-            current = self._evolve_one_month(current, ref_date, traces)
-            records.append(current.copy())
+            panel_month, current = self._evolve_one_month(current, ref_date, traces)
+            records.append(panel_month.copy())
+            closed_recs.append(panel_month[panel_month["data_fim_contrato"].notna()].copy())
 
         self._panel = pd.concat(records, ignore_index=True)
+        self._closed = pd.concat(closed_recs, ignore_index=True) if closed_recs else pd.DataFrame()
         self._trace = pd.DataFrame(traces, columns=["id_antigo", "id_novo", "data_evento"])
 
     # ------------------------------------------------------------------
@@ -545,10 +562,11 @@ class CreditDataSynthesizer:
         df: pd.DataFrame,
         ref_date: pd.Timestamp,
         trace_records: List[dict],
-    ) -> pd.DataFrame:
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         df = df.copy()
         buckets = np.array(self.buckets, dtype=np.int16)
         n_buckets = len(buckets)
+        df["age_months"] += 1
         for gp in self.group_profiles:
             mask = df["grupo_homogeneo"] == gp.name
             if not mask.any():
@@ -617,9 +635,76 @@ class CreditDataSynthesizer:
 
             df.loc[mask] = sub
 
-        df["data_ref"] = ref_date
-        df["safra"] = ref_date.strftime("%Y%m")
+        close_mask = (df["age_months"] >= df["duration_m"]) | (
+            self.rng.random(len(df)) < self.closure_rate
+        )
+        df.loc[close_mask, "data_fim_contrato"] = ref_date
+        open_df = df[~close_mask].copy()
+        closed_ids = set(df.loc[close_mask, "id_cliente"].astype(int))
+
+        # spawn new contracts -------------------------------------------------
+        new_list = []
+        for gp in self.group_profiles:
+            vivos = (open_df["grupo_homogeneo"] == gp.name).sum()
+            n_new = int(round(self.new_contract_rate * max(vivos, 1)))
+            if vivos == 0:
+                n_new = max(n_new, 1)
+            if n_new > 0:
+                active = set(open_df["id_cliente"].astype(int)).union(closed_ids)
+                new_list.append(self._spawn_new_contracts(gp, n_new, ref_date, active))
+        if new_list:
+            open_df = pd.concat([open_df] + new_list, ignore_index=True)
+
+        panel_df = pd.concat([open_df, df[close_mask]], ignore_index=True)
+        panel_df["data_ref"] = ref_date
+        panel_df["safra"] = ref_date.strftime("%Y%m")
+        open_df["data_ref"] = ref_date
+        open_df["safra"] = ref_date.strftime("%Y%m")
+        return panel_df, open_df
+
+    def _spawn_new_contracts(
+        self, gp: GroupProfile, n: int, ref_date: pd.Timestamp, active_ids: set[int]
+    ) -> pd.DataFrame:
+        if n <= 0:
+            return pd.DataFrame(columns=self._snapshot.columns if self._snapshot is not None else [])
+        df = gp.sample_contracts(
+            n,
+            rng=self.rng,
+            id_offset=self._id_counter,
+            buckets=self.buckets,
+            start_safra=ref_date,
+        )
+        self._id_counter += n
+        for idx in df.index:
+            cid, birth, sexo = self._pick_client(ref_date, active_ids)
+            start = ref_date - pd.to_timedelta(self.rng.integers(0, 30), unit="D")
+            df.at[idx, "data_inicio_contrato"] = start
+            df.at[idx, "id_cliente"] = cid
+            df.at[idx, "data_nascimento"] = birth
+            df.at[idx, "sexo"] = sexo
+            df.at[idx, "duration_m"] = self.rng.integers(6, self.max_duration_m + 1)
+            df.at[idx, "age_months"] = 0
+            df.at[idx, "data_fim_contrato"] = pd.NaT
+            active_ids.add(cid)
         return df
+
+    def _pick_client(self, ref_date: pd.Timestamp, active_ids: set[int]) -> tuple[int, pd.Timestamp, str]:
+        key = ref_date.strftime("%Y%m")
+        if self.rng.random() < self.p_existing_client and len(self._clients) > 0:
+            for _ in range(20):
+                idx = int(self.rng.integers(0, len(self._clients)))
+                cli = self._clients.iloc[idx]
+                pair = (int(cli.id_cliente), key)
+                if pair not in self._start_pairs and int(cli.id_cliente) not in active_ids:
+                    self._start_pairs.add(pair)
+                    return int(cli.id_cliente), cli.data_nascimento, cli.sexo
+        cid = int(self._next_client_id)
+        self._next_client_id += 1
+        sexo = self.rng.choice(["M", "F", "N"], p=[0.48, 0.48, 0.04])
+        birth = self.rng.choice(pd.date_range("1940-01-01", "2005-12-31", freq="D"))
+        self._clients.loc[len(self._clients)] = [cid, sexo, birth]
+        self._start_pairs.add((cid, key))
+        return cid, birth, sexo
 
     # ------------------------------------------------------------------
     def _compute_targets(self) -> None:
@@ -646,12 +731,21 @@ class CreditDataSynthesizer:
             dates = pd.to_datetime(grp["data_ref"]).to_numpy()
             idx = grp.index.to_numpy()
             event_date = trace_map.get(cid)
+            end = grp["data_fim_contrato"].dropna()
+            end_date = pd.Timestamp(end.iloc[0]) if len(end) > 0 else None
             for i in range(len(delays)):
                 start = pd.Timestamp(dates[i])
                 horizon_end_12 = start + pd.DateOffset(months=12)
                 horizon_end_18 = start + pd.DateOffset(months=18)
-                future_idx_12 = delay_idx[i : i + 13]
-                future_idx_18 = delay_idx[i : i + 19]
+                if end_date is not None:
+                    if end_date < horizon_end_12:
+                        horizon_end_12 = end_date
+                    if end_date < horizon_end_18:
+                        horizon_end_18 = end_date
+                mask12 = (dates[i:] <= horizon_end_12)
+                mask18 = (dates[i:] <= horizon_end_18)
+                future_idx_12 = delay_idx[i:][mask12]
+                future_idx_18 = delay_idx[i:][mask18]
                 if (future_idx_12 >= idx_90).any() or (
                     event_date is not None and start < event_date <= horizon_end_12
                 ):
@@ -749,6 +843,12 @@ class CreditDataSynthesizer:
         if self._trace is None:
             raise RuntimeError("Call generate() first.")
         return self._trace
+
+    @property
+    def closed(self) -> pd.DataFrame:
+        if self._closed is None:
+            raise RuntimeError("Call generate() first.")
+        return self._closed
 
     @property
     def clients(self) -> pd.DataFrame:

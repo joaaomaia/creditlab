@@ -37,7 +37,7 @@ def test_per_group_positive_presence():
 def test_sampler_group_balance():
     synth = CreditDataSynthesizer(group_profiles=default_group_profiles(2), contracts_per_group=40, n_safras=6, random_seed=2, kernel_trick=False)
     snap, panel, trace = synth.generate()
-    sampler = TargetSampler(target_ratio=0.10, per_group=True)
+    sampler = TargetSampler(target_ratio=0.10, per_group=True, max_oversample=10)
     balanced = sampler.fit_transform(panel, target_col="ever90m12", safra_col="safra", group_col="grupo_homogeneo", random_state=0)
     prev = balanced.groupby(["safra", "grupo_homogeneo"])["ever90m12"].mean()
     assert (np.abs(prev - 0.10) < 0.015).all()

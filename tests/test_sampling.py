@@ -13,6 +13,7 @@ def test_event_rate_close():
         contracts_per_group=100,
         n_safras=6,
         random_seed=0,
+        sampler_kwargs={"max_oversample": 10},
     )
     _, panel, _ = synth.generate()
     prev = panel.groupby("safra")["ever90m12"].mean()
