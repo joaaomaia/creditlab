@@ -35,7 +35,7 @@ from typing import List, Tuple
 import numpy as np
 import pandas as pd
 
-DEFAULT_BUCKETS = [0, 15, 30, 60, 90]
+DEFAULT_BUCKETS = [0, 15, 30, 60, 90, 120, 180, 240, 360]
 
 # matriz base padrao 5x5 para transicoes (sev=0)
 BASE_5x5 = np.array(
@@ -48,6 +48,13 @@ BASE_5x5 = np.array(
     ],
     dtype=float,
 )
+
+# matriz base padrao 9x9 para transicoes (sev=0)
+BASE_9x9 = np.zeros((9, 9), dtype=float)
+BASE_9x9[:5, :5] = BASE_5x5
+for i in range(5, 9):
+    BASE_9x9[i, i - 1] = 0.35
+    BASE_9x9[i, i] = 0.65
 
 import warnings
 warnings.simplefilter(action='ignore', category=pd.errors.SettingWithCopyWarning)
@@ -70,10 +77,13 @@ class GroupProfile:
     def __post_init__(self) -> None:
         if self.transition_matrix is None:
             sev = (self.pd_base - 0.02) / (0.12 - 0.02)
+            base = BASE_5x5 if len(DEFAULT_BUCKETS) == 5 else (
+                BASE_9x9 if len(DEFAULT_BUCKETS) == 9 else None
+            )
             self.transition_matrix = generate_transition_matrix(
                 DEFAULT_BUCKETS,
                 sev,
-                base_mat=BASE_5x5,
+                base_mat=base,
             )
 
     # distribuições de variáveis demográficas/financeiras serão geradas on‑the‑fly
@@ -245,6 +255,8 @@ def generate_transition_matrix(
     else:
         if n == 5:
             mat = BASE_5x5.copy()
+        elif n == 9:
+            mat = BASE_9x9.copy()
         else:
             # gera base generica para qualquer tamanho
             stay = np.array([0.6 + 0.05 * i / (n - 1) for i in range(n)], dtype=float)
@@ -330,12 +342,18 @@ class CreditDataSynthesizer:
     Parameters
     ----------
     buckets : list[int], optional
-        Lista global de buckets de atraso. Se ``None``, usa ``[0,15,30,60,90]``.
+        Lista global de buckets de atraso. Se ``None``, usa ``[0,15,30,60,90,120,180,240,360]``.
     writeoff_bucket : int, optional
         Se definido, marca ``write_off`` quando ``dias_atraso`` ≥ esse valor.
     base_matrix : np.ndarray, optional
         Matriz BASE para gerar transições dos grupos. Deve ter shape
         ``(len(buckets), len(buckets))``.
+    force_event_rate : bool, default True
+        Se True, aplica balanceamento de prevalência após gerar o painel.
+    target_ratio : float, default 0.10
+        Bad-rate desejado por safra (e por grupo se ``per_group=True``).
+    sampler_kwargs : dict, optional
+        Parâmetros extras repassados ao ``TargetSampler``.
     n_clients : int, optional
         Número total de clientes distintos na base gerada. Se ``None``, utiliza
         ``contracts_per_group * len(group_profiles) * 2``.
@@ -353,6 +371,9 @@ class CreditDataSynthesizer:
         buckets: List[int] | None = None,
         writeoff_bucket: int | None = None,
         base_matrix: np.ndarray | None = None,
+        force_event_rate: bool = True,
+        target_ratio: float = 0.10,
+        sampler_kwargs: dict | None = None,
         n_clients: int | None = None,
     ) -> None:
         self.group_profiles = group_profiles
@@ -363,6 +384,9 @@ class CreditDataSynthesizer:
         self.buckets = sorted(buckets if buckets is not None else DEFAULT_BUCKETS)
         self.writeoff_bucket = writeoff_bucket
         self.base_matrix = base_matrix
+        self.force_event_rate = force_event_rate
+        self.target_ratio = target_ratio
+        self._sampler_kwargs = sampler_kwargs or {}
 
         for gp in self.group_profiles:
             if gp.transition_matrix is None or gp.transition_matrix.shape[0] != len(self.buckets):
@@ -428,6 +452,7 @@ class CreditDataSynthesizer:
         self._generate_snapshot()
         self._generate_panel()
         self._compute_targets()
+        self._apply_sampling()
         return self._snapshot, self._panel, self._trace
 
     # ------------------------------------------------------------------
@@ -655,6 +680,54 @@ class CreditDataSynthesizer:
             .copy()
             .reset_index(drop=True)
         )
+
+    def _apply_sampling(self) -> None:
+        if not self.force_event_rate:
+            return
+        from credit_data_sampler import TargetSampler
+
+        sampler = TargetSampler(
+            target_ratio=self.target_ratio, **self._sampler_kwargs
+        )
+        self._panel = sampler.fit_transform(
+            self._panel,
+            target_col="ever90m12",
+            safra_col="safra",
+            group_col="grupo_homogeneo",
+        )
+        first_safra = self._panel["data_ref"].min()
+        self._snapshot = (
+            self._panel[self._panel["data_ref"] == first_safra]
+            .copy()
+            .reset_index(drop=True)
+        )
+
+    def plot_volume_bad_rate(
+        self,
+        *,
+        target_col: str = "ever90m12",
+        safra_col: str = "safra",
+        ax: "plt.Axes" | None = None,
+    ):
+        import matplotlib.pyplot as plt
+        import pandas as pd
+
+        df = self._panel
+        vol = df.groupby(safra_col)["id_contrato"].nunique()
+        bad = df.groupby(safra_col)[target_col].mean()
+
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(10, 4))
+        ax.bar(vol.index, vol.values, label="Volume", alpha=0.6)
+        ax.set_ylabel("# Contracts")
+        ax2 = ax.twinx()
+        ax2.plot(bad.index, bad.values, "o-", label="Bad-Rate")
+        ax2.set_ylabel("Bad-Rate")
+        ax2.yaxis.set_major_formatter(lambda x, _: f"{x:.1%}")
+        ax.set_title("Volume & Bad-Rate by Safra")
+        ax.legend(loc="upper left")
+        ax2.legend(loc="upper right")
+        return ax
 
     # ------------------------------------------------------------------
     # Properties de conveniência

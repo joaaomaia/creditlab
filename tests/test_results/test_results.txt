@@ -1,38 +1,56 @@
-============================= test session starts =============================
-platform win32 -- Python 3.11.5, pytest-7.4.0, pluggy-1.0.0 -- C:\Users\JM\AppData\Local\anaconda3\python.exe
+============================= test session starts ==============================
+platform linux -- Python 3.12.10, pytest-8.4.0, pluggy-1.6.0 -- /root/.pyenv/versions/3.12.10/bin/python3.12
 cachedir: .pytest_cache
-rootdir: C:\Users\JM\Documents\0_CienciaDados\1_Frameworks\creditlab
-plugins: anyio-3.5.0
-collecting ... collected 12 items
+rootdir: /workspace/creditlab
+collecting ... collected 25 items
 
-tests/test_realismo.py::test_transition_matrix_rowsum PASSED             [  8%]
-tests/test_realismo.py::test_targets_include_reneg PASSED                [ 16%]
-tests/test_realismo.py::test_per_group_positive_presence PASSED          [ 25%]
-tests/test_realismo.py::test_sampler_group_balance PASSED                [ 33%]
-tests/test_start_safra.py::test_custom_start_safra PASSED                [ 41%]
-tests/test_start_safra.py::test_panel_month_count PASSED                 [ 50%]
-tests/test_start_safra.py::test_first_and_last_dates PASSED              [ 58%]
-tests/test_synthesizer.py::test_snapshot_size PASSED                     [ 66%]
-tests/test_synthesizer.py::test_panel_safras_count PASSED                [ 75%]
-tests/test_synthesizer.py::test_unique_ids PASSED                        [ 83%]
-tests/test_synthesizer.py::test_features_presence PASSED                 [ 91%]
-tests/test_synthesizer.py::test_targets_flagged PASSED                   [100%]
+tests/test_buckets.py::test_bucket_membership PASSED                     [  4%]
+tests/test_buckets.py::test_matrix_size PASSED                           [  8%]
+tests/test_buckets.py::test_ever360 PASSED                               [ 12%]
+tests/test_consistency.py::test_start_before_safra PASSED                [ 16%]
+tests/test_consistency.py::test_unique_client_month PASSED               [ 20%]
+tests/test_consistency.py::test_unique_birthdate PASSED                  [ 24%]
+tests/test_consistency.py::test_targets_dynamic PASSED                   [ 28%]
+tests/test_realismo.py::test_transition_matrix_rowsum PASSED             [ 32%]
+tests/test_realismo.py::test_targets_include_reneg PASSED                [ 36%]
+tests/test_realismo.py::test_per_group_positive_presence PASSED          [ 40%]
+tests/test_realismo.py::test_sampler_group_balance PASSED                [ 44%]
+tests/test_sampling.py::test_event_rate_close PASSED                     [ 48%]
+tests/test_sampling.py::test_volume_plot_runs PASSED                     [ 52%]
+tests/test_start_safra.py::test_custom_start_safra PASSED                [ 56%]
+tests/test_start_safra.py::test_panel_month_count PASSED                 [ 60%]
+tests/test_start_safra.py::test_first_and_last_dates PASSED              [ 64%]
+tests/test_synthesizer.py::test_snapshot_size PASSED                     [ 68%]
+tests/test_synthesizer.py::test_panel_safras_count PASSED                [ 72%]
+tests/test_synthesizer.py::test_unique_ids PASSED                        [ 76%]
+tests/test_synthesizer.py::test_features_presence PASSED                 [ 80%]
+tests/test_synthesizer.py::test_targets_flagged PASSED                   [ 84%]
+tests/test_transition.py::test_matrix_rowsum PASSED                      [ 88%]
+tests/test_transition.py::test_min_diag PASSED                           [ 92%]
+tests/test_transition.py::test_shape PASSED                              [ 96%]
+tests/test_transition.py::test_monotone_risk PASSED                      [100%]
 
-============================== warnings summary ===============================
+=============================== warnings summary ===============================
+tests/test_buckets.py: 10 warnings
+tests/test_consistency.py: 10 warnings
 tests/test_realismo.py: 31 warnings
+tests/test_sampling.py: 10 warnings
 tests/test_start_safra.py: 210 warnings
 tests/test_synthesizer.py: 165 warnings
-  C:\Users\JM\Documents\0_CienciaDados\1_Frameworks\creditlab\credit_data_synthesizer.py:320: SettingWithCopyWarning: 
+  /workspace/creditlab/credit_data_synthesizer.py:575: SettingWithCopyWarning: 
   A value is trying to be set on a copy of a slice from a DataFrame.
   Try using .loc[row_indexer,col_indexer] = value instead
   
   See the caveats in the documentation: https://pandas.pydata.org/pandas-docs/stable/user_guide/indexing.html#returning-a-view-versus-a-copy
     sub["dias_atraso"] = new_delay
 
+tests/test_buckets.py: 10 warnings
+tests/test_consistency.py: 10 warnings
 tests/test_realismo.py: 31 warnings
+tests/test_sampling.py: 10 warnings
 tests/test_start_safra.py: 210 warnings
 tests/test_synthesizer.py: 165 warnings
-  C:\Users\JM\Documents\0_CienciaDados\1_Frameworks\creditlab\credit_data_synthesizer.py:321: SettingWithCopyWarning: 
+  /workspace/creditlab/credit_data_synthesizer.py:576: SettingWithCopyWarning: 
   A value is trying to be set on a copy of a slice from a DataFrame.
   Try using .loc[row_indexer,col_indexer] = value instead
   
@@ -40,4 +58,4 @@ tests/test_synthesizer.py: 165 warnings
     sub["streak_90"] = streak_90
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-====================== 12 passed, 812 warnings in 8.86s =======================
+====================== 25 passed, 872 warnings in 19.93s =======================
