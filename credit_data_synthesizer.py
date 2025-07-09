@@ -243,6 +243,28 @@ def _risk_score(mat: np.ndarray, buckets: List[int]) -> float:
     return float(mat[start, thr:].sum())
 
 
+def _apply_delay_jitter(
+    arr: np.ndarray,
+    buckets: list[int],
+    rng: np.random.Generator,
+    pct: float,
+    min_days: int,
+) -> np.ndarray:
+    """Return array jittered around bucket values without crossing midpoints."""
+    out = arr.astype(int)
+    for i, b in enumerate(buckets):
+        w = max(min_days, int(round(b * pct)))
+        w = min(w, 8)
+        lo = -min(w, b - (buckets[i - 1] if i > 0 else 0) // 2)
+        hi = min(w, (buckets[i + 1] if i < len(buckets) - 1 else b + 10) - b)
+        if i == len(buckets) - 1:
+            lo = 0
+        mask = arr == b
+        if mask.any():
+            out[mask] += rng.integers(lo, hi + 1, size=mask.sum())
+    return out
+
+
 def generate_transition_matrix(
     buckets: List[int],
     sev: float,
@@ -385,6 +407,9 @@ class CreditDataSynthesizer:
         n_clients: int | None = None,
         new_contract_rate: float = 0.05,
         closure_rate: float = 0.03,
+        jitter: bool = False,
+        jitter_pct: float = 0.10,
+        jitter_min: int = 2,
         max_duration_m: int = 72,
         p_existing_client: float = 0.7,
         id_start: int = 10_000_000,
@@ -411,6 +436,9 @@ class CreditDataSynthesizer:
         self._sampler_kwargs.setdefault("tol_pp", tol_pp)
         self.new_contract_rate = new_contract_rate
         self.closure_rate = closure_rate
+        self.jitter = jitter
+        self.jitter_pct = jitter_pct
+        self.jitter_min = jitter_min
         self.max_duration_m = max_duration_m
         self.p_existing_client = p_existing_client
         self.id_start = id_start
@@ -464,6 +492,15 @@ class CreditDataSynthesizer:
     def _log(self, msg: str, *args, lvl: int = logging.INFO) -> None:
         if self.verbose:
             self.logger.log(lvl, msg, *args)
+
+    def _log_monthly_summary(self, ref_date: pd.Timestamp, noise: np.ndarray) -> None:
+        if self.verbose and noise.size > 0:
+            self.logger.info(
+                "[month %s] jitter applied: mean(|noise|)=%.1f d, max=%d d",
+                ref_date.strftime("%m"),
+                float(np.abs(noise).mean()),
+                int(np.abs(noise).max()),
+            )
 
     # ------------------------------------------------------------------
     def _build_clients(self, n_clients: int) -> pd.DataFrame:
@@ -531,6 +568,14 @@ class CreditDataSynthesizer:
                 buckets=self.buckets,
                 start_safra=start_date,
             )
+            if self.jitter:
+                df["dias_atraso"] = _apply_delay_jitter(
+                    df["dias_atraso"].to_numpy(),
+                    self.buckets,
+                    self.rng,
+                    self.jitter_pct,
+                    self.jitter_min,
+                )
             if self.writeoff_bucket is not None:
                 df["write_off"] = 0
 
@@ -653,6 +698,7 @@ class CreditDataSynthesizer:
         n_buckets = len(buckets)
         stats = {gp.name: {"new": 0, "closed": 0, "defaults": 0} for gp in self.group_profiles}
         df["age_months"] += 1
+        noise_all: List[np.ndarray] = []
         for gp in self.group_profiles:
             mask = df["grupo_homogeneo"] == gp.name
             if not mask.any():
@@ -723,7 +769,23 @@ class CreditDataSynthesizer:
                 sub.at[idx, "num_parcelas_pagas_consecutivas"] = 0
                 sub.at[idx, "qtd_renegociacoes"] += 1
 
+            noise_arr = np.zeros(len(sub), dtype=int)
+            if self.jitter:
+                new_values = _apply_delay_jitter(
+                    sub["dias_atraso"].to_numpy(),
+                    self.buckets,
+                    self.rng,
+                    self.jitter_pct,
+                    self.jitter_min,
+                )
+                noise_arr = new_values - sub["dias_atraso"].to_numpy()
+                sub["dias_atraso"] = new_values
+            noise_all.append(noise_arr)
             df.loc[mask] = sub
+
+        if self.jitter:
+            noise_arr_all = np.concatenate(noise_all) if noise_all else np.array([], dtype=int)
+            self._log_monthly_summary(ref_date, noise_arr_all)
 
         close_mask = (df["age_months"] >= df["duration_m"]) | (
             self.rng.random(len(df)) < self.closure_rate
@@ -783,6 +845,14 @@ class CreditDataSynthesizer:
             buckets=self.buckets,
             start_safra=ref_date,
         )
+        if self.jitter:
+            df["dias_atraso"] = _apply_delay_jitter(
+                df["dias_atraso"].to_numpy(),
+                self.buckets,
+                self.rng,
+                self.jitter_pct,
+                self.jitter_min,
+            )
         for idx in df.index:
             cid, birth, sexo = self._pick_client(ref_date, active_ids)
             start = ref_date - pd.to_timedelta(self.rng.integers(0, 30), unit="D")

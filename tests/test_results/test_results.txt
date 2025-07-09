@@ -1,52 +1,70 @@
-============================= test session starts =============================
-platform win32 -- Python 3.11.5, pytest-7.4.0, pluggy-1.0.0 -- C:\Users\JM\AppData\Local\anaconda3\python.exe
+============================= test session starts ==============================
+platform linux -- Python 3.12.10, pytest-8.4.0, pluggy-1.6.0 -- /root/.pyenv/versions/3.12.10/bin/python3.12
 cachedir: .pytest_cache
-rootdir: C:\Users\JM\Documents\0_CienciaDados\1_Frameworks\creditlab
-plugins: anyio-3.5.0
-collecting ... collected 31 items
+rootdir: /workspace/creditlab
+collecting ... collected 46 items
 
-tests/test_buckets.py::test_bucket_membership PASSED                     [  3%]
-tests/test_buckets.py::test_matrix_size PASSED                           [  6%]
-tests/test_buckets.py::test_ever360 PASSED                               [  9%]
-tests/test_churn.py::test_start_leq_dataref PASSED                       [ 12%]
-tests/test_churn.py::test_one_active_contract_per_client PASSED          [ 16%]
-tests/test_churn.py::test_preserve_rank_after_sampling PASSED            [ 19%]
-tests/test_churn.py::test_churn_rates PASSED                             [ 22%]
-tests/test_consistency.py::test_start_before_safra PASSED                [ 25%]
-tests/test_consistency.py::test_unique_client_month PASSED               [ 29%]
-tests/test_consistency.py::test_unique_birthdate PASSED                  [ 32%]
-tests/test_consistency.py::test_targets_dynamic PASSED                   [ 35%]
-tests/test_realismo.py::test_transition_matrix_rowsum PASSED             [ 38%]
-tests/test_realismo.py::test_targets_include_reneg PASSED                [ 41%]
-tests/test_realismo.py::test_per_group_positive_presence PASSED          [ 45%]
-tests/test_realismo.py::test_sampler_group_balance PASSED                [ 48%]
-tests/test_sampler_order.py::test_gh_monotone_after_sampling PASSED      [ 51%]
-tests/test_sampler_order.py::test_volume_change_bounds PASSED            [ 54%]
-tests/test_sampling.py::test_event_rate_close PASSED                     [ 58%]
-tests/test_sampling.py::test_volume_plot_runs PASSED                     [ 61%]
-tests/test_start_safra.py::test_custom_start_safra PASSED                [ 64%]
-tests/test_start_safra.py::test_panel_month_count PASSED                 [ 67%]
-tests/test_start_safra.py::test_first_and_last_dates PASSED              [ 70%]
-tests/test_synthesizer.py::test_snapshot_size PASSED                     [ 74%]
-tests/test_synthesizer.py::test_panel_safras_count PASSED                [ 77%]
+tests/test_buckets.py::test_bucket_membership PASSED                     [  2%]
+tests/test_buckets.py::test_matrix_size PASSED                           [  4%]
+tests/test_buckets.py::test_ever360 PASSED                               [  6%]
+tests/test_churn.py::test_start_leq_dataref PASSED                       [  8%]
+tests/test_churn.py::test_start_month_unique_per_contract PASSED         [ 10%]
+tests/test_churn.py::test_preserve_rank_after_sampling PASSED            [ 13%]
+tests/test_churn.py::test_churn_rates PASSED                             [ 15%]
+tests/test_consistency.py::test_start_before_safra PASSED                [ 17%]
+tests/test_consistency.py::test_unique_client_start_month PASSED         [ 19%]
+tests/test_consistency.py::test_unique_birthdate PASSED                  [ 21%]
+tests/test_consistency.py::test_targets_dynamic PASSED                   [ 23%]
+tests/test_identifiers.py::test_id_format PASSED                         [ 26%]
+tests/test_identifiers.py::test_unique_ids PASSED                        [ 28%]
+tests/test_jitter.py::test_jitter_range PASSED                           [ 30%]
+tests/test_jitter.py::test_target_consistency PASSED                     [ 32%]
+tests/test_jitter.py::test_heatmap_flat_rows PASSED                      [ 34%]
+tests/test_logging.py::test_log_emits PASSED                             [ 36%]
+tests/test_logging.py::test_summary_funcs PASSED                         [ 39%]
+tests/test_new_features.py::test_refin_probability PASSED                [ 41%]
+tests/test_new_features.py::test_reneg_stage1 PASSED                     [ 43%]
+tests/test_new_features.py::test_multi_contracts PASSED                  [ 45%]
+tests/test_new_features.py::test_post_sampling_ratio PASSED              [ 47%]
+tests/test_realismo.py::test_transition_matrix_rowsum PASSED             [ 50%]
+tests/test_realismo.py::test_targets_include_reneg PASSED                [ 52%]
+tests/test_realismo.py::test_per_group_positive_presence PASSED          [ 54%]
+tests/test_realismo.py::test_sampler_group_balance PASSED                [ 56%]
+tests/test_sampler_order.py::test_gh_monotone_after_sampling PASSED      [ 58%]
+tests/test_sampler_order.py::test_volume_change_bounds PASSED            [ 60%]
+tests/test_sampling.py::test_event_rate_close PASSED                     [ 63%]
+tests/test_sampling.py::test_volume_plot_runs PASSED                     [ 65%]
+tests/test_sampling_realloc.py::test_sampling_realloc PASSED             [ 67%]
+tests/test_start_safra.py::test_custom_start_safra PASSED                [ 69%]
+tests/test_start_safra.py::test_panel_month_count PASSED                 [ 71%]
+tests/test_start_safra.py::test_first_and_last_dates PASSED              [ 73%]
+tests/test_synthesizer.py::test_snapshot_size PASSED                     [ 76%]
+tests/test_synthesizer.py::test_panel_safras_count PASSED                [ 78%]
 tests/test_synthesizer.py::test_unique_ids PASSED                        [ 80%]
-tests/test_synthesizer.py::test_features_presence PASSED                 [ 83%]
-tests/test_synthesizer.py::test_targets_flagged PASSED                   [ 87%]
-tests/test_transition.py::test_matrix_rowsum PASSED                      [ 90%]
-tests/test_transition.py::test_min_diag PASSED                           [ 93%]
-tests/test_transition.py::test_shape PASSED                              [ 96%]
+tests/test_synthesizer.py::test_features_presence PASSED                 [ 82%]
+tests/test_synthesizer.py::test_targets_flagged PASSED                   [ 84%]
+tests/test_tm_options.py::test_rebin_moves_counts PASSED                 [ 86%]
+tests/test_tm_options.py::test_drop_updates_labels PASSED                [ 89%]
+tests/test_tm_options.py::test_no_flat_rows PASSED                       [ 91%]
+tests/test_transition.py::test_matrix_rowsum PASSED                      [ 93%]
+tests/test_transition.py::test_min_diag PASSED                           [ 95%]
+tests/test_transition.py::test_shape PASSED                              [ 97%]
 tests/test_transition.py::test_monotone_risk PASSED                      [100%]
 
-============================== warnings summary ===============================
+=============================== warnings summary ===============================
 tests/test_buckets.py: 10 warnings
 tests/test_churn.py: 66 warnings
 tests/test_consistency.py: 10 warnings
+tests/test_identifiers.py: 20 warnings
+tests/test_jitter.py: 14 warnings
+tests/test_new_features.py: 16 warnings
 tests/test_realismo.py: 31 warnings
 tests/test_sampler_order.py: 30 warnings
 tests/test_sampling.py: 10 warnings
+tests/test_sampling_realloc.py: 14 warnings
 tests/test_start_safra.py: 210 warnings
 tests/test_synthesizer.py: 165 warnings
-  C:\Users\JM\Documents\0_CienciaDados\1_Frameworks\creditlab\credit_data_synthesizer.py:593: SettingWithCopyWarning: 
+  /workspace/creditlab/credit_data_synthesizer.py:732: SettingWithCopyWarning: 
   A value is trying to be set on a copy of a slice from a DataFrame.
   Try using .loc[row_indexer,col_indexer] = value instead
   
@@ -56,30 +74,74 @@ tests/test_synthesizer.py: 165 warnings
 tests/test_buckets.py: 10 warnings
 tests/test_churn.py: 66 warnings
 tests/test_consistency.py: 10 warnings
+tests/test_identifiers.py: 20 warnings
+tests/test_jitter.py: 14 warnings
+tests/test_new_features.py: 16 warnings
 tests/test_realismo.py: 31 warnings
 tests/test_sampler_order.py: 30 warnings
 tests/test_sampling.py: 10 warnings
+tests/test_sampling_realloc.py: 14 warnings
 tests/test_start_safra.py: 210 warnings
 tests/test_synthesizer.py: 165 warnings
-  C:\Users\JM\Documents\0_CienciaDados\1_Frameworks\creditlab\credit_data_synthesizer.py:594: SettingWithCopyWarning: 
+  /workspace/creditlab/credit_data_synthesizer.py:733: SettingWithCopyWarning: 
   A value is trying to be set on a copy of a slice from a DataFrame.
   Try using .loc[row_indexer,col_indexer] = value instead
   
   See the caveats in the documentation: https://pandas.pydata.org/pandas-docs/stable/user_guide/indexing.html#returning-a-view-versus-a-copy
     sub["streak_90"] = streak_90
 
-tests/test_realismo.py::test_sampler_group_balance
-tests/test_realismo.py::test_sampler_group_balance
-tests/test_realismo.py::test_sampler_group_balance
-tests/test_realismo.py::test_sampler_group_balance
-tests/test_realismo.py::test_sampler_group_balance
-tests/test_realismo.py::test_sampler_group_balance
-  C:\Users\JM\Documents\0_CienciaDados\1_Frameworks\creditlab\credit_data_sampler.py:174: FutureWarning: The default of observed=False is deprecated and will be changed to True in a future version of pandas. Pass observed=False to retain current behavior or observed=True to adopt the future default and silence this warning.
+tests/test_buckets.py: 100 warnings
+tests/test_churn.py: 65 warnings
+tests/test_consistency.py: 30 warnings
+tests/test_logging.py: 31 warnings
+tests/test_new_features.py: 36 warnings
+tests/test_realismo.py: 81 warnings
+tests/test_sampling.py: 39 warnings
+  /workspace/creditlab/credit_data_sampler.py:194: FutureWarning: The default of observed=False is deprecated and will be changed to True in a future version of pandas. Pass observed=False to retain current behavior or observed=True to adopt the future default and silence this warning.
     df_safra.groupby(group_col)[target_col]
 
+tests/test_buckets.py: 2 warnings
+tests/test_churn.py: 2 warnings
+tests/test_consistency.py: 2 warnings
+tests/test_logging.py: 5 warnings
+tests/test_new_features.py: 3 warnings
+tests/test_realismo.py: 6 warnings
+tests/test_sampling.py: 4 warnings
+  /workspace/creditlab/credit_data_sampler.py:254: FutureWarning: The default of observed=False is deprecated and will be changed to True in a future version of pandas. Pass observed=False to retain current behavior or observed=True to adopt the future default and silence this warning.
+    final_rates = df.groupby([safra_col, group_col])[target_col].mean()
+
+tests/test_buckets.py: 1 warning
+tests/test_churn.py: 1 warning
+tests/test_consistency.py: 1 warning
+tests/test_logging.py: 3 warnings
+tests/test_realismo.py: 4 warnings
+tests/test_sampling.py: 1 warning
+  /workspace/creditlab/credit_data_sampler.py:186: FutureWarning: The default of observed=False is deprecated and will be changed to True in a future version of pandas. Pass observed=False to retain current behavior or observed=True to adopt the future default and silence this warning.
+    before = df.groupby([safra_col, group_col])[target_col].mean()
+
+tests/test_jitter.py: 14 warnings
+  /workspace/creditlab/credit_data_synthesizer.py:782: SettingWithCopyWarning: 
+  A value is trying to be set on a copy of a slice from a DataFrame.
+  Try using .loc[row_indexer,col_indexer] = value instead
+  
+  See the caveats in the documentation: https://pandas.pydata.org/pandas-docs/stable/user_guide/indexing.html#returning-a-view-versus-a-copy
+    sub["dias_atraso"] = new_values
+
+tests/test_logging.py::test_log_emits
+  /workspace/creditlab/credit_data_synthesizer.py:1009: FutureWarning: The default of observed=False is deprecated and will be changed to True in a future version of pandas. Pass observed=False to retain current behavior or observed=True to adopt the future default and silence this warning.
+    after = self._panel.groupby(["safra", "grupo_homogeneo"])["ever90m12"].mean()
+
+tests/test_logging.py::test_log_emits
+  /workspace/creditlab/credit_data_synthesizer.py:1120: FutureWarning: The default of observed=False is deprecated and will be changed to True in a future version of pandas. Pass observed=False to retain current behavior or observed=True to adopt the future default and silence this warning.
+    order = self._panel.groupby("grupo_homogeneo")["ever90m12"].mean().to_dict()
+
+tests/test_logging.py::test_summary_funcs
+  /workspace/creditlab/credit_data_synthesizer.py:1188: FutureWarning: The default of observed=False is deprecated and will be changed to True in a future version of pandas. Pass observed=False to retain current behavior or observed=True to adopt the future default and silence this warning.
+    return self._panel.groupby("grupo_homogeneo").agg(
+
 tests/test_realismo.py::test_sampler_group_balance
-  C:\Users\JM\Documents\0_CienciaDados\1_Frameworks\creditlab\tests\test_realismo.py:42: FutureWarning: The default of observed=False is deprecated and will be changed to True in a future version of pandas. Pass observed=False to retain current behavior or observed=True to adopt the future default and silence this warning.
+  /workspace/creditlab/tests/test_realismo.py:42: FutureWarning: The default of observed=False is deprecated and will be changed to True in a future version of pandas. Pass observed=False to retain current behavior or observed=True to adopt the future default and silence this warning.
     prev = balanced.groupby(["safra", "grupo_homogeneo"])["ever90m12"].mean()
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-===================== 31 passed, 1071 warnings in 40.04s ======================
+================ 46 passed, 1627 warnings in 115.03s (0:01:55) =================
