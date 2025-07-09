@@ -1,6 +1,11 @@
 # credit_data_sampler.py
 """Sampler util to rebalance per‑safra target prevalence in the creditlab panel.
 
+Changelog
+---------
+- v0.2.0  Adiciona ``preserve_gh_order`` para manter a ordenação de risco dos
+  grupos homogêneos durante o balanceamento.
+
 Typical use
 -----------
 >>> from credit_data_sampler import TargetSampler
@@ -21,6 +26,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from typing import Tuple, List
+import warnings
 
 __all__ = ["TargetSampler"]
 
@@ -38,6 +44,10 @@ class TargetSampler:
         conforme necessário).
     per_group : bool, default False
         Se True, aplica balanceamento dentro de cada ``grupo_homogeneo`` e safra.
+    preserve_gh_order : bool, default False
+        Mantém a ordenação de risco dos grupos homogêneos após o sampling.
+        ``per_group`` força o balanceamento individual; já ``preserve_gh_order``
+        apenas garante monotonicidade nas bad-rates.
     min_pos : int, default 5
         Número mínimo de positivos por grupo antes do downsample (com oversampling).
     """
@@ -48,6 +58,7 @@ class TargetSampler:
         *,
         keep_positives: bool = True,
         per_group: bool = False,
+        preserve_gh_order: bool = False,
         min_pos: int = 5,
     ):
         if not 0 < target_ratio < 1:
@@ -55,7 +66,73 @@ class TargetSampler:
         self.target_ratio = target_ratio
         self.keep_positives = keep_positives
         self.per_group = per_group
+        self.preserve_gh_order = preserve_gh_order
         self.min_pos = min_pos
+
+    # ------------------------------------------------------------------
+    def _jitter(self, df: pd.DataFrame, target_col: str, rng: np.random.Generator) -> None:
+        num_cols = df.select_dtypes(include=["float", "int"]).columns.difference([target_col])
+        for col in num_cols:
+            std = df[col].std() if df[col].std() > 0 else 1
+            df[col] += rng.normal(0, std * 0.01, size=len(df))
+
+    def _sample_negatives(
+        self,
+        neg: pd.DataFrame,
+        new_size: int,
+        target_col: str,
+        rng: np.random.Generator,
+    ) -> pd.DataFrame:
+        cur = len(neg)
+        if cur >= new_size:
+            idx = rng.choice(neg.index, size=new_size, replace=False)
+            return neg.loc[idx]
+        extra_idx = rng.choice(neg.index, size=new_size - cur, replace=True)
+        extra = neg.loc[extra_idx].copy()
+        self._jitter(extra, target_col, rng)
+        return pd.concat([neg, extra], ignore_index=True)
+
+    def _balance_group_monotone(
+        self,
+        grp: pd.DataFrame,
+        *,
+        target_col: str,
+        prev_rate: float | None,
+        rng: np.random.Generator,
+    ) -> Tuple[pd.DataFrame, float]:
+        pos = grp[grp[target_col] == 1]
+        neg = grp[grp[target_col] == 0]
+
+        n_pos = len(pos)
+        n_neg = len(neg)
+        if n_pos < self.min_pos and n_pos > 0:
+            extra = pos.sample(self.min_pos - n_pos, replace=True, random_state=rng.integers(0, 1_000_000))
+            self._jitter(extra, target_col, rng)
+            pos = pd.concat([pos, extra], ignore_index=True)
+            n_pos = len(pos)
+
+        if n_pos == 0 or n_neg == 0:
+            rate = n_pos / (n_pos + n_neg) if (n_pos + n_neg) > 0 else 0.0
+            return grp, rate
+
+        desired_neg = int(np.round(n_pos * (1 - self.target_ratio) / self.target_ratio))
+        max_neg = int(n_neg * 1.2)
+        if prev_rate is not None:
+            req_neg = int(np.ceil(n_pos * (1 - prev_rate) / prev_rate)) if prev_rate > 0 else max_neg
+            desired_neg = max(desired_neg, req_neg)
+
+        if desired_neg > max_neg:
+            warnings.warn(
+                "Unable to fully preserve GH order; limiting negative oversampling.",
+                RuntimeWarning,
+            )
+            desired_neg = max_neg
+
+        neg_bal = self._sample_negatives(neg, desired_neg, target_col, rng)
+        grp_bal = pd.concat([pos, neg_bal], ignore_index=True)
+        rate = len(pos) / len(grp_bal)
+        return grp_bal, rate
+
 
     # ------------------------------------------------------------------
     # Core API
@@ -72,59 +149,68 @@ class TargetSampler:
         """Return a new DataFrame with rebalanced target prevalence por safra."""
         rng = np.random.default_rng(random_state)
         pieces: List[pd.DataFrame] = []
-        group_keys = [safra_col]
-        if self.per_group:
-            group_keys.append(group_col)
 
-        for keys, grp in panel.groupby(group_keys, sort=False):
-            pos = grp[grp[target_col] == 1]
-            neg = grp[grp[target_col] == 0]
+        if self.preserve_gh_order:
+            for safra, df_safra in panel.groupby(safra_col, sort=False):
+                order = (
+                    df_safra.groupby(group_col)[target_col]
+                    .mean()
+                    .sort_values(ascending=False)
+                    .index
+                )
+                prev = None
+                for gh in order:
+                    grp = df_safra[df_safra[group_col] == gh]
+                    bal, prev = self._balance_group_monotone(
+                        grp,
+                        target_col=target_col,
+                        prev_rate=prev,
+                        rng=rng,
+                    )
+                    pieces.append(bal)
+        else:
+            group_keys = [safra_col]
+            if self.per_group:
+                group_keys.append(group_col)
 
-            n_pos = len(pos)
-            n_neg = len(neg)
-            if n_pos < self.min_pos and n_pos > 0:
-                extra = pos.sample(self.min_pos - n_pos, replace=True, random_state=rng.integers(0, 1_000_000))
-                num_cols = extra.select_dtypes(include=["float", "int"]).columns.difference([target_col])
-                for col in num_cols:
-                    std = extra[col].std() if extra[col].std() > 0 else 1
-                    extra[col] += rng.normal(0, std * 0.01, size=len(extra))
-                pos = pd.concat([pos, extra], ignore_index=True)
+            for _, grp in panel.groupby(group_keys, sort=False):
+                pos = grp[grp[target_col] == 1]
+                neg = grp[grp[target_col] == 0]
+
                 n_pos = len(pos)
+                n_neg = len(neg)
 
-            if n_pos == 0 or n_neg == 0:
-                pieces.append(grp)
-                continue
+                if n_pos < self.min_pos and n_pos > 0:
+                    extra = pos.sample(
+                        self.min_pos - n_pos,
+                        replace=True,
+                        random_state=rng.integers(0, 1_000_000),
+                    )
+                    self._jitter(extra, target_col, rng)
+                    pos = pd.concat([pos, extra], ignore_index=True)
+                    n_pos = len(pos)
 
-            # razão atual
-            r = n_pos / (n_pos + n_neg)
-            if self.keep_positives:
-                new_neg_n = int(n_pos * (1 - self.target_ratio) / self.target_ratio)
-                if n_neg >= new_neg_n:
-                    sampled_neg_idx = rng.choice(neg.index, size=new_neg_n, replace=False)
-                    neg = neg.loc[sampled_neg_idx]
+                if n_pos == 0 or n_neg == 0:
+                    pieces.append(grp)
+                    continue
+
+                if self.keep_positives:
+                    new_neg_n = int(n_pos * (1 - self.target_ratio) / self.target_ratio)
+                    neg = self._sample_negatives(neg, new_neg_n, target_col, rng)
+                    grp_bal = pd.concat([pos, neg], ignore_index=True)
                 else:
-                    extra_idx = rng.choice(neg.index, size=new_neg_n - n_neg, replace=True)
-                    extra = neg.loc[extra_idx].copy()
-                    num_cols = extra.select_dtypes(include=["float", "int"]).columns.difference([target_col])
-                    for col in num_cols:
-                        std = extra[col].std() if extra[col].std() > 0 else 1
-                        extra[col] += rng.normal(0, std * 0.01, size=len(extra))
-                    neg = pd.concat([neg, extra], ignore_index=True)
-                grp_bal = pd.concat([pos, neg], ignore_index=True)
-            else:
-                # amostragem simétrica (pode reduzir qualquer lado)
-                total_desired = int((n_pos + n_neg))  # preserva tamanho
-                n_pos_desired = int(total_desired * self.target_ratio)
-                n_neg_desired = total_desired - n_pos_desired
-                if n_pos > n_pos_desired:
-                    pos_idx = rng.choice(pos.index, size=n_pos_desired, replace=False)
-                    pos = pos.loc[pos_idx]
-                if n_neg > n_neg_desired:
-                    neg_idx = rng.choice(neg.index, size=n_neg_desired, replace=False)
-                    neg = neg.loc[neg_idx]
-                grp_bal = pd.concat([pos, neg], ignore_index=True)
+                    total_desired = int(n_pos + n_neg)
+                    n_pos_desired = int(total_desired * self.target_ratio)
+                    n_neg_desired = total_desired - n_pos_desired
+                    if n_pos > n_pos_desired:
+                        pos_idx = rng.choice(pos.index, size=n_pos_desired, replace=False)
+                        pos = pos.loc[pos_idx]
+                    if n_neg > n_neg_desired:
+                        neg_idx = rng.choice(neg.index, size=n_neg_desired, replace=False)
+                        neg = neg.loc[neg_idx]
+                    grp_bal = pd.concat([pos, neg], ignore_index=True)
 
-            pieces.append(grp_bal)
+                pieces.append(grp_bal)
 
         balanced = pd.concat(pieces, ignore_index=True)
         # reorder rows by original order of safras to keep panel temporality
