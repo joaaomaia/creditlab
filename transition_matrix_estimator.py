@@ -108,51 +108,101 @@ class TransitionMatrixLearner:
         raise ValueError("Specify either gh or stage (or neither for global)")
 
     # ------------------------------------------------------------------
+
     def plot_heatmaps(self, modes: List[str] | None = None) -> List[plt.Figure]:
-        """Plot heatmaps for requested modalities.
+        """
+        Plot heatmaps for requested modalities.
 
         Parameters
         ----------
         modes : list[str] | None
             Options: "global", "grupo_homogeneo", "stage". Default = ["global"].
+
         Returns
         -------
         list[matplotlib.figure.Figure]
         """
         if modes is None:
             modes = ["global"]
-        figs: List[plt.Figure] = []
 
+        figs: List[plt.Figure] = []
         cmap = sns.color_palette("Blues", as_cmap=True)
         xt = yt = [str(b) for b in self.buckets]
 
+        def _prep(mat: np.ndarray, thr: float = 0.5) -> pd.DataFrame:
+            """
+            Converte a matriz em percentuais e substitui por NaN
+            todos os valores abaixo do limiar 'thr' (em pontos-percentuais).
+            """
+            perc = mat * 100
+            perc[perc < thr] = np.nan        # “apaga” zeros (e ≈0) para não aparecerem
+            return pd.DataFrame(perc, index=yt, columns=xt)
+
+
+        # 1. Global
         if "global" in modes:
+            df = _prep(self._mat_global)
+            mask = df.isna()
             fig, ax = plt.subplots(figsize=(6, 5))
-            sns.heatmap(self._mat_global, annot=True, fmt=".2f", cmap=cmap, ax=ax,
-                        xticklabels=xt, yticklabels=yt)
-            ax.set_title("Global Transition Matrix")
-            ax.set_xlabel("Next bucket"); ax.set_ylabel("Current bucket")
+            sns.heatmap(
+                df,
+                mask=df.isna(),   # células < thr ficam brancas
+                annot=True,
+                fmt=".0f",
+                cmap=cmap,
+                ax=ax,
+                xticklabels=xt,
+                yticklabels=yt,
+            )
+            ax.set_title("Matriz de Transição Global (%)")
+            ax.set_xlabel("Bucket Atraso - Próxima Safra")
+            ax.set_ylabel("Bucket Atraso - Safra Atual")
             figs.append(fig)
 
+        # 2. Grupo homogêneo
         if "grupo_homogeneo" in modes:
             for gh, mat in self._mat_by_gh.items():
+                df = _prep(mat)
+                mask = df.isna()
                 fig, ax = plt.subplots(figsize=(6, 5))
-                sns.heatmap(mat, annot=False, cmap=cmap, ax=ax,
-                            xticklabels=xt, yticklabels=yt)
-                ax.set_title(f"Transition Matrix – {gh}")
-                ax.set_xlabel("Next bucket"); ax.set_ylabel("Current bucket")
+                sns.heatmap(
+                    df,
+                    mask=df.isna(),   # células < thr ficam brancas
+                    annot=True,
+                    fmt=".0f",
+                    cmap=cmap,
+                    ax=ax,
+                    xticklabels=xt,
+                    yticklabels=yt,
+                )
+                ax.set_title(f"Transition Matrix – {gh} (%)")
+                ax.set_xlabel("Next bucket")
+                ax.set_ylabel("Current bucket")
                 figs.append(fig)
 
+        # 3. Stage atual
         if "stage" in modes:
             for stage, mat in self._mat_by_stage.items():
+                df = _prep(mat)
+                mask = df.isna()
                 fig, ax = plt.subplots(figsize=(6, 5))
-                sns.heatmap(mat, annot=False, cmap=cmap, ax=ax,
-                            xticklabels=xt, yticklabels=yt)
-                ax.set_title(f"Transition Matrix – current bucket {stage}")
-                ax.set_xlabel("Next bucket"); ax.set_ylabel("Current bucket")
+                sns.heatmap(
+                    df,
+                    mask=df.isna(),   # células < thr ficam brancas
+                    annot=True,
+                    fmt=".0f",
+                    cmap=cmap,
+                    ax=ax,
+                    xticklabels=xt,
+                    yticklabels=yt,
+                )
+                ax.set_title(f"Transition Matrix – current bucket {stage} (%)")
+                ax.set_xlabel("Next bucket")
+                ax.set_ylabel("Current bucket")
                 figs.append(fig)
 
         return figs
+
 
 
 # # ---------------------------------------------------------------------------
