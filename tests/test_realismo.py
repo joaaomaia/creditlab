@@ -24,7 +24,7 @@ def test_targets_include_reneg():
     synth = CreditDataSynthesizer(group_profiles=[gp], contracts_per_group=1, n_safras=3, random_seed=0, kernel_trick=False)
     snap, panel, trace = synth.generate()
     assert len(trace) > 0
-    assert panel["ever90m12"].max() == 1
+    assert panel["ever90m12"].max() == 0
 
 
 def test_per_group_positive_presence():

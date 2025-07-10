@@ -151,12 +151,16 @@ class TargetSampler:
             req_neg = int(np.ceil(n_pos * (1 - prev_rate) / prev_rate))
             desired_neg = max(desired_neg, req_neg)
 
-        desired_neg = min(desired_neg, n_neg)
-
+        orig_neg = n_neg
         if desired_neg < n_neg:
             keep_idx = rng.choice(neg.index, size=desired_neg, replace=False)
             removed = neg.drop(keep_idx)
             neg_bal = neg.loc[keep_idx]
+        elif desired_neg > n_neg and self.strategy == "hybrid":
+            max_allowed = int(orig_neg * self.max_oversample)
+            final_size = min(desired_neg, max_allowed)
+            neg_bal = self._sample_negatives(neg, final_size, target_col, rng)
+            removed = pd.DataFrame(columns=neg.columns)
         else:
             removed = pd.DataFrame(columns=neg.columns)
             neg_bal = neg
@@ -237,10 +241,15 @@ class TargetSampler:
                             pieces.append(grp_df)
                             continue
                         desired_neg = int(round(n_pos * (1 - self.target_ratio) / self.target_ratio))
+                        orig_neg = n_neg
                         if desired_neg < n_neg:
                             keep_idx = rng.choice(neg.index, size=desired_neg, replace=False)
                             overflow.append(neg.drop(keep_idx))
                             neg = neg.loc[keep_idx]
+                        elif desired_neg > n_neg and self.strategy == "hybrid":
+                            max_allowed = int(orig_neg * self.max_oversample)
+                            final_size = min(desired_neg, max_allowed)
+                            neg = self._sample_negatives(neg, final_size, target_col, rng)
                         grp_bal = pd.concat([pos, neg], ignore_index=True)
                         pieces.append(grp_bal)
 
