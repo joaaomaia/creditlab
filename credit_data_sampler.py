@@ -29,7 +29,7 @@ from typing import Tuple, List
 import warnings
 import logging
 
-logger = logging.getLogger("creditlab.sampler")
+logger = logging.getLogger("creditlab").getChild("sampler")
 logger.setLevel(logging.INFO)
 
 __all__ = ["TargetSampler"]
@@ -76,6 +76,7 @@ class TargetSampler:
         strategy: str = "undersample",
         max_iter: int = 3,
         tol_pp: float = 0.5,
+        adaptive_tol: bool = True,
     ):
         if not 0 < target_ratio < 1:
             raise ValueError("target_ratio must be between 0 and 1 (exclusive)")
@@ -94,6 +95,7 @@ class TargetSampler:
         self.strategy = strategy
         self.max_iter = max_iter
         self.tol_pp = float(tol_pp)
+        self.adaptive_tol = adaptive_tol
         self.logger = logger.getChild(self.__class__.__name__)
 
     # ------------------------------------------------------------------
@@ -156,11 +158,12 @@ class TargetSampler:
             keep_idx = rng.choice(neg.index, size=desired_neg, replace=False)
             removed = neg.drop(keep_idx)
             neg_bal = neg.loc[keep_idx]
-        elif desired_neg > n_neg and self.strategy == "hybrid":
-            max_allowed = int(orig_neg * self.max_oversample)
-            final_size = min(desired_neg, max_allowed)
-            neg_bal = self._sample_negatives(neg, final_size, target_col, rng)
+        elif desired_neg > n_neg:
+            self.logger.warning(
+                "Insufficient negatives: required=%d available=%d", desired_neg, n_neg
+            )
             removed = pd.DataFrame(columns=neg.columns)
+            neg_bal = neg
         else:
             removed = pd.DataFrame(columns=neg.columns)
             neg_bal = neg
@@ -168,7 +171,9 @@ class TargetSampler:
         grp_bal = pd.concat([pos, neg_bal], ignore_index=True)
         rate = len(pos) / len(grp_bal)
         if abs(rate - self.target_ratio) > self.tolerance_pp / 100:
-            logging.info("Target ratio deviates %.1f pp in group", (rate - self.target_ratio) * 100)
+            self.logger.info(
+                "Target ratio deviates %.1f pp in group", (rate - self.target_ratio) * 100
+            )
         return grp_bal, rate, removed
 
 
@@ -183,14 +188,17 @@ class TargetSampler:
         safra_col: str = "safra",
         group_col: str = "grupo_homogeneo",
         random_state: int | None = None,
-    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Return balanced panel and overflow DataFrame."""
+        return_info: bool = False,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame] | Tuple[pd.DataFrame, pd.DataFrame, dict]:
+        """Return balanced panel, overflow DataFrame and diagnostics."""
         rng = np.random.default_rng(random_state)
         df = panel.copy()
         before = df.groupby([safra_col, group_col])[target_col].mean()
         overflow: List[pd.DataFrame] = []
+        cur_tol = self.tol_pp
+        order_violation = False
 
-        for _ in range(self.max_iter):
+        for it in range(self.max_iter):
             pieces: List[pd.DataFrame] = []
             for safra, df_safra in df.groupby(safra_col, sort=False):
                 if self.preserve_rank:
@@ -204,15 +212,31 @@ class TargetSampler:
                     bal_groups: List[pd.DataFrame] = []
                     for gh in order:
                         grp = df_safra[df_safra[group_col] == gh]
-                        bal, prev, rem = self._balance_group_monotone(
+                        r_before = grp[target_col].mean()
+                        bal, rate, rem = self._balance_group_monotone(
                             grp,
                             target_col=target_col,
                             prev_rate=prev,
                             rng=rng,
                         )
+                        if prev is not None and rate > prev:
+                            bal = grp
+                            rate = r_before
+                            rem = pd.DataFrame(columns=grp.columns)
+                            order_violation = True
+                        self._log(
+                            "iter=%d safra=%s GH=%s r_before=%.4f r_after=%.4f",
+                            it + 1,
+                            safra,
+                            gh,
+                            r_before,
+                            rate,
+                            lvl=logging.DEBUG,
+                        )
                         bal_groups.append(bal)
                         if not rem.empty:
                             overflow.append(rem)
+                        prev = rate
                     cat = pd.CategoricalDtype(order, ordered=True)
                     for df_b in bal_groups:
                         df_b[group_col] = df_b[group_col].astype(cat)
@@ -255,19 +279,40 @@ class TargetSampler:
 
             new_df = pd.concat(pieces, ignore_index=True)
             rates = new_df.groupby(safra_col)[target_col].mean()
-            if (rates - self.target_ratio).abs().max() < self.tol_pp / 100:
+            if (rates - self.target_ratio).abs().max() < cur_tol / 100:
                 df = new_df
                 break
             df = new_df
+            if self.adaptive_tol:
+                cur_tol = max(cur_tol * 0.8, 0.3)
 
         final_rates = df.groupby([safra_col, group_col])[target_col].mean()
         delta = (final_rates - before).round(4)
         self._log("sampling \u0394pp %s", delta.to_dict())
-        if (final_rates.groupby(level=0).mean() - self.target_ratio).abs().max() > self.tol_pp / 100:
-            self.logger.warning("Unable to reach target ratio within %.1f pp", self.tol_pp)
+        max_pp = float((final_rates.groupby(level=0).mean() - self.target_ratio).abs().max() * 100)
+        if max_pp > self.tol_pp:
+            self.logger.warning(
+                "Unable to reach target ratio within %.1f pp", self.tol_pp
+            )
 
         balanced = df.sort_values([safra_col, "id_contrato", "data_ref"], kind="mergesort").reset_index(drop=True)
         overflow_df = pd.concat(overflow, ignore_index=True) if overflow else pd.DataFrame(columns=panel.columns)
+
+        gh_order_ok = True
+        rates_by_gh = final_rates.unstack(group_col)
+        order = sorted(rates_by_gh.columns)
+        for _, row in rates_by_gh.iterrows():
+            if not row.reindex(order).is_monotonic_decreasing:
+                gh_order_ok = False
+                break
+
+        info = {
+            "delta_pp": delta.to_dict(),
+            "max_pp": max_pp,
+            "order_ok": gh_order_ok and not order_violation,
+        }
+        if return_info:
+            return balanced, overflow_df, info
         return balanced, overflow_df
 
 
