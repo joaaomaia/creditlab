@@ -63,7 +63,7 @@ import warnings
 import logging
 warnings.simplefilter(action='ignore', category=pd.errors.SettingWithCopyWarning)
 
-logger = logging.getLogger("creditlab.synth")
+logger = logging.getLogger("creditlab").getChild("synth")
 logger.setLevel(logging.INFO)
 
 # =============================================================================
@@ -415,8 +415,8 @@ class CreditDataSynthesizer:
         target_ratio: float = 0.10,
         sampler_kwargs: dict | None = None,
         n_clients: int | None = None,
-        new_contract_rate: float = 0.05,
-        closure_rate: float = 0.03,
+        new_contract_rate: float | List[float] | None = None,
+        closure_rate: float | List[float] | None = None,
         jitter: bool = False,
         jitter_pct: float = 0.10,
         jitter_min: int = 2,
@@ -430,6 +430,7 @@ class CreditDataSynthesizer:
         tol_pp: float = 0.5,
         max_simultaneous_contracts: int = 3,
         max_recompute_iter: int = 2,
+        min_volume: int = 30,
         verbose: bool = False,
     ) -> None:
         self.group_profiles = group_profiles
@@ -444,8 +445,18 @@ class CreditDataSynthesizer:
         self.target_ratio = target_ratio
         self._sampler_kwargs = sampler_kwargs or {}
         self._sampler_kwargs.setdefault("tol_pp", tol_pp)
-        self.new_contract_rate = new_contract_rate
-        self.closure_rate = closure_rate
+        n_groups = len(group_profiles)
+        pd_vals = np.array([gp.pd_base for gp in group_profiles], dtype=float)
+        if new_contract_rate is None:
+            self.new_contract_rate = np.interp(pd_vals, (pd_vals.min(), pd_vals.max()), (0.06, 0.03))
+        else:
+            arr = np.asarray(new_contract_rate, dtype=float)
+            self.new_contract_rate = np.full(n_groups, arr) if arr.ndim == 0 else arr
+        if closure_rate is None:
+            self.closure_rate = np.interp(pd_vals, (pd_vals.min(), pd_vals.max()), (0.03, 0.06))
+        else:
+            arr = np.asarray(closure_rate, dtype=float)
+            self.closure_rate = np.full(n_groups, arr) if arr.ndim == 0 else arr
         self.jitter = jitter
         self.jitter_pct = jitter_pct
         self.jitter_min = jitter_min
@@ -459,6 +470,7 @@ class CreditDataSynthesizer:
         self.realloc_window = realloc_window
         self.max_simultaneous_contracts = max_simultaneous_contracts
         self.max_recompute_iter = max_recompute_iter
+        self.min_volume = min_volume
         self.verbose = verbose
         self.logger = logger.getChild(self.__class__.__name__)
 
@@ -562,10 +574,34 @@ class CreditDataSynthesizer:
         self._generate_snapshot()
         self._log_rates("snapshot", self._snapshot)
         self._generate_panel()
-        self._compute_targets()
+        tol_pp = self._sampler_kwargs.get("tol_pp", 0.5)
+        for k in range(self.max_recompute_iter):
+            self._compute_targets()
+            from credit_data_sampler import TargetSampler
+
+            sampler = TargetSampler(
+                target_ratio=self.target_ratio,
+                strategy=self.sampler_strategy,
+                **self._sampler_kwargs,
+            )
+            self._panel, overflow, info = sampler.fit_transform(
+                self._panel,
+                target_col="ever90m12",
+                safra_col="safra",
+                group_col="grupo_homogeneo",
+                random_state=self.rng.integers(0, 1_000_000),
+                return_info=True,
+            )
+            self._log("recompute %d: max_pp=%.2f", k + 1, info["max_pp"])
+            if info["max_pp"] <= tol_pp and info["order_ok"]:
+                break
+            self._reinject(overflow)
+        self._snapshot = (
+            self._panel[self._panel["data_ref"] == self._panel["data_ref"].min()] 
+            .copy()
+            .reset_index(drop=True)
+        )
         self._log_rates("final", self._panel)
-        self._apply_sampling()
-        self._recompute_targets_post_sampling()
         return self._snapshot, self._panel, self._trace
 
     # ------------------------------------------------------------------
@@ -602,7 +638,7 @@ class CreditDataSynthesizer:
 
             contracts.append(df)
             self._log(
-                "snapshot %s rows=%d pos=%.1f%%",
+                "snapshot GH=%s rows=%d bad=%.2f%%",
                 gp.name,
                 len(df),
                 df["ever90m12"].mean() * 100,
@@ -691,13 +727,13 @@ class CreditDataSynthesizer:
             records.append(panel_month.copy())
             closed_recs.append(panel_month[panel_month["data_fim_contrato"].notna()].copy())
             monthly_rate = panel_month["ever90m12"].mean() * 100
+            delta_pp = monthly_rate - self.target_ratio * 100
             self._log(
-                "%s summary: rows=%d new=%d closed=%d bad=%.1f%%",
+                "%s summary rows=%d bad=%.2f%% \u0394pp=%.2f",
                 ref_date.strftime("%Y-%m"),
                 len(panel_month),
-                sum(s["new"] for s in stats.values()),
-                sum(s["closed"] for s in stats.values()),
                 monthly_rate,
+                delta_pp,
             )
             self._log_rates(ref_date.strftime("%Y-%m"), current)
 
@@ -717,7 +753,6 @@ class CreditDataSynthesizer:
         n_buckets = len(buckets)
         stats = {gp.name: {"new": 0, "closed": 0, "defaults": 0} for gp in self.group_profiles}
         df["age_months"] += 1
-        noise_all: List[np.ndarray] = []
         for gp in self.group_profiles:
             mask = df["grupo_homogeneo"] == gp.name
             if not mask.any():
@@ -789,26 +824,16 @@ class CreditDataSynthesizer:
                 sub.at[idx, "qtd_renegociacoes"] += 1
 
             noise_arr = np.zeros(len(sub), dtype=int)
-            if self.jitter:
-                new_values = _apply_delay_jitter(
-                    sub["dias_atraso"].to_numpy(),
-                    self.buckets,
-                    self.rng,
-                    self.jitter_pct,
-                    self.jitter_min,
-                )
-                noise_arr = new_values - sub["dias_atraso"].to_numpy()
-                sub["dias_atraso"] = new_values
-            noise_all.append(noise_arr)
             df.loc[mask] = sub
 
-        if self.jitter:
-            noise_arr_all = np.concatenate(noise_all) if noise_all else np.array([], dtype=int)
-            self._log_monthly_summary(ref_date, noise_arr_all)
-
-        close_mask = (df["age_months"] >= df["duration_m"]) | (
-            self.rng.random(len(df)) < self.closure_rate
-        )
+        rates_close = {gp.name: rate for gp, rate in zip(self.group_profiles, self.closure_rate)}
+        close_mask = np.zeros(len(df), dtype=bool)
+        for gp in self.group_profiles:
+            mask = df["grupo_homogeneo"] == gp.name
+            prob = rates_close[gp.name]
+            rand = self.rng.random(mask.sum())
+            base = (df.loc[mask, "age_months"] >= df.loc[mask, "duration_m"]).to_numpy()
+            close_mask[mask] = base | (rand < prob)
         df.loc[close_mask, "data_fim_contrato"] = ref_date
         open_df = df[~close_mask].copy()
         closed_ids = set(df.loc[close_mask, "id_cliente"].astype(int))
@@ -818,9 +843,12 @@ class CreditDataSynthesizer:
 
         # spawn new contracts -------------------------------------------------
         new_list = []
-        for gp in self.group_profiles:
+        for idx_gp, gp in enumerate(self.group_profiles):
             vivos = (open_df["grupo_homogeneo"] == gp.name).sum()
-            n_new = int(round(self.new_contract_rate * max(vivos, 1)))
+            if vivos < self.min_volume:
+                continue
+            rate_new = self.new_contract_rate[idx_gp]
+            n_new = int(round(rate_new * max(vivos, 1)))
             if vivos == 0:
                 n_new = max(n_new, 1)
             if n_new > 0:
@@ -842,12 +870,11 @@ class CreditDataSynthesizer:
             defaults = stats[gp.name]["defaults"]
             bad = defaults / size * 100 if size > 0 else 0.0
             self._log(
-                "%s GH=%s new=%d closed=%d defaults=%d bad_rate=%.1f%%",
+                "%s GH=%s new=%d closed=%d bad=%.2f%%",
                 ref_date.strftime("%Y-%m"),
                 gp.name,
                 stats[gp.name]["new"],
                 stats[gp.name]["closed"],
-                defaults,
                 bad,
             )
         return panel_df, open_df, stats
@@ -1007,143 +1034,8 @@ class CreditDataSynthesizer:
         )
 
     def _apply_sampling(self) -> None:
-        if not self.force_event_rate:
-            return
-        from credit_data_sampler import TargetSampler
+        pass  # deprecated
 
-        sampler = TargetSampler(
-            target_ratio=self.target_ratio,
-            strategy=self.sampler_strategy,
-            max_iter=self.max_sampling_iter,
-            **self._sampler_kwargs,
-        )
-        if self.verbose:
-            before = self._panel.groupby(["safra", "grupo_homogeneo"])["ever90m12"].mean()
-            self._log("sampling before %s", before.round(4).to_dict())
-        self._panel, overflow = sampler.fit_transform(
-            self._panel,
-            target_col="ever90m12",
-            safra_col="safra",
-            group_col="grupo_homogeneo",
-            random_state=self.rng.integers(0, 1_000_000),
-        )
-        if self.verbose:
-            after = self._panel.groupby(["safra", "grupo_homogeneo"])["ever90m12"].mean()
-            self._log("sampling \u0394pp %s", (after - before).round(4).to_dict())
-        if not overflow.empty:
-            self._reinject(overflow)
-            self._log("overflow=%d reinjected=%d", len(overflow), len(overflow))
-        first_safra = self._panel["data_ref"].min()
-        self._snapshot = (
-            self._panel[self._panel["data_ref"] == first_safra]
-            .copy()
-            .reset_index(drop=True)
-        )
-
-    def _recompute_targets_post_sampling(self) -> None:
-        for it in range(1, self.max_recompute_iter + 1):
-            assert self._panel is not None
-            panel = self._panel.sort_values(["id_contrato", "data_ref"])  # type: ignore[assignment]
-            ever = np.zeros(len(panel), dtype="int8")
-            over = np.zeros(len(panel), dtype="int8")
-            ever360 = np.zeros(len(panel), dtype="int8")
-
-            idx_90 = next(i for i, b in enumerate(self.buckets) if b >= 90)
-            idx_60 = next(i for i, b in enumerate(self.buckets) if b >= 60)
-            try:
-                idx_360 = next(i for i, b in enumerate(self.buckets) if b >= 360)
-            except StopIteration:
-                idx_360 = len(self.buckets) - 1
-            idx_30 = next(i for i, b in enumerate(self.buckets) if b >= 30)
-
-            trace_map = {row.id_antigo: pd.Timestamp(row.data_evento) for row in self._trace.itertuples()}
-
-            for cid, grp in panel.groupby("id_contrato"):
-                delays = grp["dias_atraso"].to_numpy()
-                delay_idx = np.array([bucket_index(d, self.buckets) for d in delays], dtype=int)
-                dates = pd.to_datetime(grp["data_ref"]).to_numpy()
-                idx = grp.index.to_numpy()
-                event_date = trace_map.get(cid)
-                end = grp["data_fim_contrato"].dropna()
-                end_date = pd.Timestamp(end.iloc[0]) if len(end) > 0 else None
-                for i in range(len(delays)):
-                    start = pd.Timestamp(dates[i])
-                    horizon_end_12 = start + pd.DateOffset(months=12)
-                    horizon_end_18 = start + pd.DateOffset(months=18)
-                    if end_date is not None:
-                        if end_date < horizon_end_12:
-                            horizon_end_12 = end_date
-                        if end_date < horizon_end_18:
-                            horizon_end_18 = end_date
-                    mask12 = (dates[i:] <= horizon_end_12)
-                    mask18 = (dates[i:] <= horizon_end_18)
-                    future_idx_12 = delay_idx[i:][mask12]
-                    future_idx_18 = delay_idx[i:][mask18]
-                    if (future_idx_12 >= idx_90).any() or (
-                        event_date is not None
-                        and start < event_date <= horizon_end_12
-                        and delay_idx[i] >= idx_60
-                    ):
-                        ever[idx[i]] = 1
-
-                    idx90 = np.where(future_idx_12 >= idx_90)[0]
-                    if len(idx90) > 0:
-                        first = idx90[0]
-                        if (future_idx_12[first:] >= idx_30).all():
-                            over[idx[i]] = 1
-
-                    if (future_idx_18 >= idx_360).any():
-                        ever360[idx[i]] = 1
-
-            self._panel["ever90m12"] = ever
-            self._panel["over90m12"] = over
-            self._panel["ever360m18"] = ever360
-
-            if not self.force_event_rate:
-                break
-            from credit_data_sampler import TargetSampler
-
-            sampler = TargetSampler(
-                target_ratio=self.target_ratio,
-                strategy=self.sampler_strategy,
-                max_iter=self.max_sampling_iter,
-                **self._sampler_kwargs,
-            )
-            new_panel, overflow = sampler.fit_transform(
-                self._panel,
-                target_col="ever90m12",
-                safra_col="safra",
-                group_col="grupo_homogeneo",
-                random_state=self.rng.integers(0, 1_000_000),
-            )
-            if new_panel.equals(self._panel):
-                final_rates = new_panel.groupby("safra")["ever90m12"].mean()
-                diff = (final_rates - self.target_ratio).abs().max() * 100
-                self._log("recompute %d: max_pp=%.2f", it, diff)
-                break
-            self._panel = new_panel
-            if not overflow.empty:
-                self._reinject(overflow)
-            final_rates = self._panel.groupby("safra")["ever90m12"].mean()
-            diff = (final_rates - self.target_ratio).abs().max() * 100
-            self._log("recompute %d: max_pp=%.2f", it, diff)
-
-        first_safra = self._panel["data_ref"].min()
-        self._snapshot = (
-            self._panel[self._panel["data_ref"] == first_safra]
-            .copy()
-            .reset_index(drop=True)
-        )
-        final_rates = self._panel.groupby("safra")["ever90m12"].mean()
-        diff = (final_rates - self.target_ratio).abs().max() * 100
-        if diff > self._sampler_kwargs.get("tol_pp", 0.5):
-            self.logger.warning(
-                "Unable to reach target ratio within %.1f pp",
-                self._sampler_kwargs.get("tol_pp", 0.5),
-            )
-        if self.verbose:
-            order = self._panel.groupby("grupo_homogeneo")["ever90m12"].mean().to_dict()
-            self.logger.info("Bad-rate order %s", order)
 
     def plot_volume_bad_rate(
         self,
