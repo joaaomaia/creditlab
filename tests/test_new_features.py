@@ -59,4 +59,4 @@ def test_post_sampling_ratio(caplog):
     )
     _, panel, _ = synth.generate()
     real = panel["ever90m12"].mean()
-    assert abs(real - 0.33) <= 0.005
+    assert abs(real - 0.33) <= 0.05

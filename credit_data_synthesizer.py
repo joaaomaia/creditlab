@@ -53,6 +53,8 @@ BASE_5x5 = np.array(
 # matriz base padrao 9x9 para transicoes (sev=0)
 BASE_9x9 = np.zeros((9, 9), dtype=float)
 BASE_9x9[:5, :5] = BASE_5x5
+BASE_9x9[0, 0] = 0.8
+BASE_9x9[0, 1] = 0.2
 for i in range(5, 9):
     BASE_9x9[i, i - 1] = 0.35
     BASE_9x9[i, i] = 0.65
@@ -341,23 +343,31 @@ def generate_transition_matrix(
     mat /= mat.sum(axis=1, keepdims=True)
     return mat
 
-def default_group_profiles(n_groups: int) -> List[GroupProfile]:
+def default_group_profiles(
+    n_groups: int,
+    *,
+    reneg_prob_line: np.ndarray | None = None,
+    refin_prob: np.ndarray | None = None,
+) -> List[GroupProfile]:
     """Cria *n_groups* perfis padrão numerados GH1…GHn.
 
     GH1 é o mais arriscado (PD ~ 12 %), GHn o menos arriscado (PD ~ 2 %).
     """
     worst_pd, best_pd = 0.12, 0.02
+    if reneg_prob_line is None:
+        reneg_prob_line = np.linspace(0.10, 0.015, n_groups)
+    if refin_prob is None:
+        refin_prob = np.linspace(0.05, 0.25, n_groups)
     profiles: List[GroupProfile] = []
     for i in range(n_groups):
-        interp = i / (n_groups - 1) if n_groups > 1 else 0  # 0…1
+        interp = i / (n_groups - 1) if n_groups > 1 else 0
         pd_base = worst_pd - interp * (worst_pd - best_pd)
-        reneg_prob = 0.15 - interp * 0.10  # piores renegociam mais
         profiles.append(
             GroupProfile(
                 name=f"GH{i+1}",
                 pd_base=pd_base,
-                p_accept_refin=0.5,
-                reneg_prob_exog=reneg_prob,
+                p_accept_refin=float(refin_prob[i]),
+                reneg_prob_exog=float(reneg_prob_line[i]),
             )
         )
     return profiles
@@ -502,6 +512,12 @@ class CreditDataSynthesizer:
                 int(np.abs(noise).max()),
             )
 
+    def _log_rates(self, label: str, df: pd.DataFrame) -> None:
+        if not self.verbose:
+            return
+        rates = df.groupby("grupo_homogeneo")["ever90m12"].mean()
+        self._log("%s bad-rate %s", label, rates.round(3).to_dict())
+
     # ------------------------------------------------------------------
     def _build_clients(self, n_clients: int) -> pd.DataFrame:
         rng = self.rng
@@ -544,8 +560,10 @@ class CreditDataSynthesizer:
         """
 
         self._generate_snapshot()
+        self._log_rates("snapshot", self._snapshot)
         self._generate_panel()
         self._compute_targets()
+        self._log_rates("final", self._panel)
         self._apply_sampling()
         self._recompute_targets_post_sampling()
         return self._snapshot, self._panel, self._trace
@@ -681,6 +699,7 @@ class CreditDataSynthesizer:
                 sum(s["closed"] for s in stats.values()),
                 monthly_rate,
             )
+            self._log_rates(ref_date.strftime("%Y-%m"), current)
 
         self._panel = pd.concat(records, ignore_index=True)
         self._closed = pd.concat(closed_recs, ignore_index=True) if closed_recs else pd.DataFrame()
@@ -926,6 +945,7 @@ class CreditDataSynthesizer:
         cura = np.zeros(len(self._panel), dtype="int8")
 
         idx_90 = next(i for i, b in enumerate(self.buckets) if b >= 90)
+        idx_60 = next(i for i, b in enumerate(self.buckets) if b >= 60)
         try:
             idx_360 = next(i for i, b in enumerate(self.buckets) if b >= 360)
         except StopIteration:
@@ -956,7 +976,9 @@ class CreditDataSynthesizer:
                 future_idx_12 = delay_idx[i:][mask12]
                 future_idx_18 = delay_idx[i:][mask18]
                 if (future_idx_12 >= idx_90).any() or (
-                    event_date is not None and start < event_date <= horizon_end_12
+                    event_date is not None
+                    and start < event_date <= horizon_end_12
+                    and delay_idx[i] >= idx_60
                 ):
                     ever[idx[i]] = 1
 
@@ -1027,6 +1049,7 @@ class CreditDataSynthesizer:
             ever360 = np.zeros(len(panel), dtype="int8")
 
             idx_90 = next(i for i, b in enumerate(self.buckets) if b >= 90)
+            idx_60 = next(i for i, b in enumerate(self.buckets) if b >= 60)
             try:
                 idx_360 = next(i for i, b in enumerate(self.buckets) if b >= 360)
             except StopIteration:
@@ -1057,7 +1080,9 @@ class CreditDataSynthesizer:
                     future_idx_12 = delay_idx[i:][mask12]
                     future_idx_18 = delay_idx[i:][mask18]
                     if (future_idx_12 >= idx_90).any() or (
-                        event_date is not None and start < event_date <= horizon_end_12
+                        event_date is not None
+                        and start < event_date <= horizon_end_12
+                        and delay_idx[i] >= idx_60
                     ):
                         ever[idx[i]] = 1
 
