@@ -60,6 +60,8 @@ class TargetSampler:
         atingido quando o oversampling é limitado.
     min_pos : int, default 5
         Número mínimo de positivos por grupo antes do downsample (com oversampling).
+    min_neg : int, default 25
+        Tamanho mínimo do grupo de negativos após o oversample.
     """
 
     def __init__(
@@ -72,6 +74,7 @@ class TargetSampler:
         max_oversample: float = 2.0,
         tolerance_pp: float = 2.0,
         min_pos: int = 5,
+        min_neg: int = 25,
         preserve_gh_order: bool | None = None,
         strategy: str = "undersample",
         max_iter: int = 3,
@@ -90,6 +93,7 @@ class TargetSampler:
         self.tolerance_pp = float(tolerance_pp)
         self.preserve_gh_order = self.preserve_rank  # backward compat
         self.min_pos = min_pos
+        self.min_neg = min_neg
         if strategy not in {"undersample", "oversample", "hybrid"}:
             raise ValueError("strategy must be 'undersample', 'oversample' or 'hybrid'")
         self.strategy = strategy
@@ -132,7 +136,9 @@ class TargetSampler:
         target_col: str,
         prev_rate: float | None,
         rng: np.random.Generator,
-    ) -> Tuple[pd.DataFrame, float, pd.DataFrame]:
+        safra: str | None = None,
+        gh: str | None = None,
+    ) -> Tuple[pd.DataFrame, float, pd.DataFrame, int]:
         pos = grp[grp[target_col] == 1]
         neg = grp[grp[target_col] == 0]
 
@@ -146,7 +152,7 @@ class TargetSampler:
 
         if n_pos == 0 or n_neg == 0:
             rate = n_pos / (n_pos + n_neg) if (n_pos + n_neg) > 0 else 0.0
-            return grp, rate, pd.DataFrame(columns=grp.columns)
+            return grp, rate, pd.DataFrame(columns=grp.columns), 0
 
         desired_neg = int(np.round(n_pos * (1 - self.target_ratio) / self.target_ratio))
         if prev_rate is not None and prev_rate > 0:
@@ -154,16 +160,21 @@ class TargetSampler:
             desired_neg = max(desired_neg, req_neg)
 
         orig_neg = n_neg
+        shortfall = 0
         if desired_neg < n_neg:
             keep_idx = rng.choice(neg.index, size=desired_neg, replace=False)
             removed = neg.drop(keep_idx)
             neg_bal = neg.loc[keep_idx]
         elif desired_neg > n_neg:
-            self.logger.warning(
-                "Insufficient negatives: required=%d available=%d", desired_neg, n_neg
-            )
+            max_allowed = int(n_neg * self.max_oversample)
+            final_size = min(max_allowed, max(desired_neg, self.min_neg))
+            neg_bal = self._sample_negatives(neg, final_size, target_col, rng)
             removed = pd.DataFrame(columns=neg.columns)
-            neg_bal = neg
+            if final_size < desired_neg:
+                shortfall = desired_neg - final_size
+                self.logger.warning(
+                    "Insufficient negatives: required=%d available=%d", desired_neg, n_neg
+                )
         else:
             removed = pd.DataFrame(columns=neg.columns)
             neg_bal = neg
@@ -174,7 +185,17 @@ class TargetSampler:
             self.logger.info(
                 "Target ratio deviates %.1f pp in group", (rate - self.target_ratio) * 100
             )
-        return grp_bal, rate, removed
+        self.logger.debug(
+            "safra=%s GH=%s pos=%d neg=%d desired_neg=%d final_neg=%d r=%.3f",
+            safra,
+            gh,
+            n_pos,
+            n_neg,
+            desired_neg,
+            len(neg_bal),
+            rate,
+        )
+        return grp_bal, rate, removed, shortfall
 
 
     # ------------------------------------------------------------------
@@ -190,11 +211,16 @@ class TargetSampler:
         random_state: int | None = None,
         return_info: bool = False,
     ) -> Tuple[pd.DataFrame, pd.DataFrame] | Tuple[pd.DataFrame, pd.DataFrame, dict]:
-        """Return balanced panel, overflow DataFrame and diagnostics."""
+        """Return balanced panel, overflow DataFrame and diagnostics.
+
+        When ``return_info=True`` the third element includes ``unmet_groups``
+        with the negative shortfall per safra and GH.
+        """
         rng = np.random.default_rng(random_state)
         df = panel.copy()
         before = df.groupby([safra_col, group_col])[target_col].mean()
         overflow: List[pd.DataFrame] = []
+        unmet_groups: dict[tuple[str, str], int] = {}
         cur_tol = self.tol_pp
         order_violation = False
 
@@ -213,11 +239,13 @@ class TargetSampler:
                     for gh in order:
                         grp = df_safra[df_safra[group_col] == gh]
                         r_before = grp[target_col].mean()
-                        bal, rate, rem = self._balance_group_monotone(
+                        bal, rate, rem, shortfall = self._balance_group_monotone(
                             grp,
                             target_col=target_col,
                             prev_rate=prev,
                             rng=rng,
+                            safra=safra,
+                            gh=gh,
                         )
                         if prev is not None and rate > prev:
                             bal = grp
@@ -234,6 +262,8 @@ class TargetSampler:
                             lvl=logging.DEBUG,
                         )
                         bal_groups.append(bal)
+                        if shortfall > 0:
+                            unmet_groups[(safra, gh)] = shortfall
                         if not rem.empty:
                             overflow.append(rem)
                         prev = rate
@@ -266,14 +296,27 @@ class TargetSampler:
                             continue
                         desired_neg = int(round(n_pos * (1 - self.target_ratio) / self.target_ratio))
                         orig_neg = n_neg
+                        shortfall = 0
                         if desired_neg < n_neg:
                             keep_idx = rng.choice(neg.index, size=desired_neg, replace=False)
                             overflow.append(neg.drop(keep_idx))
                             neg = neg.loc[keep_idx]
-                        elif desired_neg > n_neg and self.strategy == "hybrid":
+                        elif desired_neg > n_neg and self.strategy in {"hybrid", "oversample"}:
                             max_allowed = int(orig_neg * self.max_oversample)
-                            final_size = min(desired_neg, max_allowed)
+                            final_size = min(max_allowed, max(desired_neg, self.min_neg))
                             neg = self._sample_negatives(neg, final_size, target_col, rng)
+                            if final_size < desired_neg:
+                                shortfall = desired_neg - final_size
+                                self.logger.warning(
+                                    "Insufficient negatives: required=%d available=%d", desired_neg, n_neg
+                                )
+                        elif desired_neg > n_neg:
+                            self.logger.warning(
+                                "Insufficient negatives: required=%d available=%d", desired_neg, n_neg
+                            )
+                            shortfall = desired_neg - n_neg
+                        if shortfall > 0:
+                            unmet_groups[(safra, grp_df[group_col].iloc[0])] = shortfall
                         grp_bal = pd.concat([pos, neg], ignore_index=True)
                         pieces.append(grp_bal)
 
@@ -310,6 +353,7 @@ class TargetSampler:
             "delta_pp": delta.to_dict(),
             "max_pp": max_pp,
             "order_ok": gh_order_ok and not order_violation,
+            "unmet_groups": unmet_groups,
         }
         if return_info:
             return balanced, overflow_df, info
