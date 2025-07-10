@@ -355,7 +355,7 @@ def default_group_profiles(
     """
     worst_pd, best_pd = 0.12, 0.02
     if reneg_prob_line is None:
-        reneg_prob_line = np.linspace(0.10, 0.015, n_groups)
+        reneg_prob_line = np.linspace(0.06, 0.01, n_groups)
     if refin_prob is None:
         refin_prob = np.linspace(0.05, 0.25, n_groups)
     profiles: List[GroupProfile] = []
@@ -593,7 +593,11 @@ class CreditDataSynthesizer:
                 return_info=True,
             )
             self._log("recompute %d: max_pp=%.2f", k + 1, info["max_pp"])
+            if info.get("unmet_groups"):
+                self.logger.warning("unmet groups: %s", info["unmet_groups"])
             if info["max_pp"] <= tol_pp and info["order_ok"]:
+                break
+            if not info.get("unmet_groups"):
                 break
             self._reinject(overflow)
         self._snapshot = (
@@ -1002,11 +1006,12 @@ class CreditDataSynthesizer:
                 mask18 = (dates[i:] <= horizon_end_18)
                 future_idx_12 = delay_idx[i:][mask12]
                 future_idx_18 = delay_idx[i:][mask18]
-                if (future_idx_12 >= idx_90).any() or (
+                trigger_reneg = (
                     event_date is not None
                     and start < event_date <= horizon_end_12
                     and delay_idx[i] >= idx_60
-                ):
+                )
+                if (future_idx_12 >= idx_90).any() or trigger_reneg:
                     ever[idx[i]] = 1
 
                 idx90 = np.where(future_idx_12 >= idx_90)[0]
