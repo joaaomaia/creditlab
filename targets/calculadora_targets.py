@@ -1,8 +1,11 @@
 import pandas as pd
-from typing import List, Tuple, Literal, Dict, Sequence
+from typing import List, Tuple, Literal, Dict, Sequence, Hashable
 from collections import defaultdict
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import numpy as np
+import random
+from pandas.tseries.offsets import DateOffset
 
 TargetType = Literal["ever", "over"]
 
@@ -201,3 +204,84 @@ class CalculadoraTargets:
             fig.update_yaxes(ticksuffix=" %", secondary_y=True)
 
         return fig
+    
+
+    def audit_contract(
+        self,
+        df: pd.DataFrame,
+        *,
+        contract_id: Hashable | None = None,
+        random_state: int | None = None,
+        show_only_mismatches: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Verifica, linha a linha, se cada target calculado para um contrato
+        específico está correto.
+
+        Parameters
+        ----------
+        df : DataFrame
+            Saída do método `calcular`, contendo os targets 0/1.
+        contract_id : valor hashable ou None
+            Identificador do contrato a auditar. Se None → escolhe aleatoriamente.
+        random_state : int | None
+            Semente para reprodutibilidade quando `contract_id` é None.
+        show_only_mismatches : bool
+            True  ➜ retorna apenas divergências; False ➜ todas as linhas.
+
+        Returns
+        -------
+        DataFrame
+            Colunas: contrato, data, target, dpd, actual, expected, __match__.
+        """
+        # -------- 1. Seleção do contrato ---------------------------------
+        if contract_id is None:
+            rng = np.random.default_rng(random_state)
+            contract_id = rng.choice(df[self.contract_col].unique())
+
+        sub = (
+            df.loc[df[self.contract_col] == contract_id]
+              .sort_values(self.date_col)
+              .copy()
+        )
+        if sub.empty:
+            raise ValueError(f"Contrato '{contract_id}' não encontrado no DataFrame.")
+
+        # garantir coluna de datas datetime
+        if "_date" not in sub.columns:
+            sub["_date"] = pd.to_datetime(sub[self.date_col], format="%Y%m")
+
+        # -------- 2. Recalcular targets manualmente ----------------------
+        evid_rows: list[dict] = []
+
+        for _, row in sub.iterrows():
+            row_date = row["_date"]
+
+            for name, t_type, days, horizon in self._parsed_specs:
+                horizon_end = row_date + DateOffset(months=horizon)
+
+                if t_type == "ever":
+                    mask = (sub["_date"] >= row_date) & (sub["_date"] <= horizon_end)
+                    expected = int((sub.loc[mask, self.dpd_col] >= days).any())
+                else:  # over
+                    match_row = sub.loc[sub["_date"] == horizon_end, self.dpd_col]
+                    expected = int((match_row >= days).any()) if not match_row.empty else 0
+
+                actual = int(row[name])
+                evid_rows.append(
+                    {
+                        self.contract_col: contract_id,
+                        self.date_col: row[self.date_col],
+                        "target": name,
+                        "dpd": row[self.dpd_col],
+                        "actual": actual,
+                        "expected": expected,
+                        "__match__": actual == expected,
+                    }
+                )
+
+        evid = pd.DataFrame(evid_rows)
+        if show_only_mismatches:
+            evid = evid.loc[~evid["__match__"]]
+
+        return evid
