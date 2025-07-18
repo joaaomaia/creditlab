@@ -169,7 +169,7 @@ class CalculadoraTargets:
             go.Bar(
                 x=n_contracts.index,
                 y=n_contracts.values,
-                name="Contracts",
+                name="Contratos",
                 marker_color=bar_color,
                 opacity=0.7,
             ),
