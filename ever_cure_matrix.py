@@ -259,14 +259,14 @@ class EverCureMatrixLearner:
         return figs
 
 
-if __name__ == "__main__":
-    # Quick demo with random panel
-    ids = np.repeat(np.arange(5), 24)
-    dates = pd.date_range("2020-01-01", periods=24, freq="M").tolist() * 5
-    delays = np.random.choice([0, 15, 30, 60, 90], size=len(ids))
-    demo = pd.DataFrame({"id": ids, "ref": dates, "bucket": delays})
+# if __name__ == "__main__":
+#     # Quick demo with random panel
+#     ids = np.repeat(np.arange(5), 24)
+#     dates = pd.date_range("2020-01-01", periods=24, freq="M").tolist() * 5
+#     delays = np.random.choice([0, 15, 30, 60, 90], size=len(ids))
+#     demo = pd.DataFrame({"id": ids, "ref": dates, "bucket": delays})
 
-    ecm = EverCureMatrixLearner(buckets=[0, 15, 30, 60, 90])
-    ecm.fit(demo, id_col="id", time_col="ref", bucket_col="bucket")
-    ecm.plot_heatmaps()
-    plt.show()
+#     ecm = EverCureMatrixLearner(buckets=[0, 15, 30, 60, 90])
+#     ecm.fit(demo, id_col="id", time_col="ref", bucket_col="bucket")
+#     ecm.plot_heatmaps()
+#     plt.show()
