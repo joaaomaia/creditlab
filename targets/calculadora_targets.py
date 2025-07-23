@@ -14,6 +14,7 @@ class CalculadoraTargets:
     Uma classe para calcular metas de inadimplência ('ever' e 'over') em um DataFrame.
     """
 
+
     def __init__(
         self,
         specs: List[Tuple[TargetType, int, int]],
@@ -34,6 +35,7 @@ class CalculadoraTargets:
             else:
                 self._over_specs_grouped[horizon].append((name, days))
 
+
     def _parse_specs(
         self, specs: List[Tuple[TargetType, int, int]]
     ) -> List[Tuple[str, TargetType, int, int]]:
@@ -46,6 +48,7 @@ class CalculadoraTargets:
             name = f"{t_type}{days}m{horizon}"
             out.append((name, t_type, days, horizon))
         return out
+
 
     def _calculate_ever_targets(self, df: pd.DataFrame) -> None:
         """
@@ -113,7 +116,114 @@ class CalculadoraTargets:
             
             for col_name, days_threshold in specs_for_horizon:
                 df[col_name] = (df[f"_dpd_h{horizon}"] >= days_threshold).astype("int8") 
-    
+
+
+    def _flag_bad_columns(
+        self,
+        df: pd.DataFrame,
+        flag_col: str = "flag_acordo",
+    ) -> None:
+        """
+        Para cada limite `days` presente em `self._parsed_specs`,
+        cria a coluna `bad{days}`:
+            bad{days} = 1  se  (dpd >= days)  OU  flag_acordo == 1
+                    = 0  caso contrário
+        """
+        if flag_col not in df.columns:
+            raise KeyError(f"Coluna '{flag_col}' não encontrada no DataFrame.")
+
+        unique_days = sorted({days for _, _, days, _ in self._parsed_specs})
+
+        for days in unique_days:
+            col_bad = f"bad{days}"
+            df[col_bad] = (
+                (df[self.dpd_col].fillna(0) >= days) |
+                (df[flag_col].fillna(0).astype(bool))
+            ).astype("int8")
+
+
+    def _calculate_ever_targets_from_bad(self, df: pd.DataFrame) -> None:
+        """
+        Cria `target_{sufixo}` (ex.: target_ever90m12) usando as colunas `bad{days}`.
+        Regra: na janela FUTURA t0+1 … t0+horizon existe ≥1 ocorrência de bad==1.
+        """
+        df.sort_values([self.contract_col, "_date"], inplace=True)
+
+        for name, t_type, days, horizon in self._parsed_specs:
+            if t_type != "ever":
+                continue
+
+            col_bad = f"bad{days}"
+            target_col = f"target_{name}"
+
+            # ---- janela futuro -------------------------------------------------
+            base = (
+                df[[self.contract_col, "_date"]]
+                .assign(_idx=df.index,
+                        _start=df["_date"] + DateOffset(months=1),
+                        _end=df["_date"] + DateOffset(months=horizon))
+            )
+
+            fut = (
+                df[[self.contract_col, "_date", col_bad]]
+                .rename(columns={"_date": "_f_date", col_bad: "_f_bad"})
+            )
+
+            joined = (
+                base.merge(fut, on=self.contract_col, how="left")
+                    .query("_f_date >= _start and _f_date <= _end and _f_bad == 1")
+            )
+
+            flag_any = joined.groupby("_idx")["_f_bad"].max()
+            df[target_col] = flag_any.reindex(df.index, fill_value=0).astype("int8")
+
+
+    def _calculate_over_targets_from_bad(self, df: pd.DataFrame) -> None:
+        """
+        Cria `target_{sufixo}` (ex.: target_over30m4) usando `bad{days}`.
+        Regra: na data t0+horizon o bad==1 (merge_asof ±7 dias).
+        """
+        df.sort_values([self.contract_col, "_date"], inplace=True)
+
+        for name, t_type, days, horizon in self._parsed_specs:
+            if t_type != "over":
+                continue
+
+            col_bad     = f"bad{days}"
+            target_col  = f"target_{name}"
+
+            # --------- datas‑base --------------------------------------------
+            base = (
+                df[[self.contract_col, "_date"]]
+                .assign(_idx=df.index,
+                        _hdate=df["_date"] + DateOffset(months=horizon))
+                .sort_values("_hdate")
+            )
+
+            fut = (
+                df[[self.contract_col, "_date", col_bad]]
+                .rename(columns={"_date": "_f_date", col_bad: "_f_bad"})
+                .sort_values("_f_date")
+            )
+
+            merged = pd.merge_asof(
+                base, fut,
+                by=self.contract_col,
+                left_on="_hdate",
+                right_on="_f_date",
+                direction="nearest",
+                tolerance=pd.Timedelta(days=7)
+            )
+
+            # --------- preenche NaN → 0 e converte ---------------------------
+            df[target_col] = (
+                merged.set_index("_idx")["_f_bad"]
+                    .reindex(df.index)       # alinha pelo idx original
+                    .fillna(0)               # <-- evita IntCastingNaNError
+                    .astype("int8")
+            )
+
+
     def calcular(self, df: pd.DataFrame) -> pd.DataFrame:
         df_out = df.copy()
         
@@ -134,7 +244,7 @@ class CalculadoraTargets:
         df_out.drop(columns=cols_to_drop, inplace=True)
 
         return df_out
-    
+
 
     def plot_targets(
         self,
@@ -223,7 +333,7 @@ class CalculadoraTargets:
             fig.update_yaxes(ticksuffix=" %", secondary_y=True)
 
         return fig
-    
+
 
     def audit_contract(
         self,
