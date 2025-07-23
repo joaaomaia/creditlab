@@ -48,29 +48,48 @@ class CalculadoraTargets:
         return out
 
     def _calculate_ever_targets(self, df: pd.DataFrame) -> None:
+        """
+        Calcula os targets 'ever' respeitando:
+        • janela prospectiva (t0 + 1 … t0 + horizon)
+        • critério “existe ≥ days em QUALQUER mês da janela”
+        """
+        # 0) ordenação ascendente obrigatória
+        df.sort_values([self.contract_col, "_date"], inplace=True)
+
         for horizon, specs_for_horizon in self._ever_specs_grouped.items():
-            df_rev = df.sort_values([self.contract_col, "_date"], ascending=[True, False])
-            
-            window_in_days = f"{horizon * 31}D"
-            
-            max_future_dpd = (
-                df_rev.groupby(self.contract_col, group_keys=False)
-                      .rolling(window=window_in_days, on="_date", min_periods=1)[self.dpd_col]
-                      .max()
-            )
-                        
-            # >>> NOVO TRECHO <<< -----------------------------------------------
             col_aux = f"_max_dpd_{horizon}m"
 
-            # 1) preenche em df_rev sem realinhamento
-            df_rev[col_aux] = max_future_dpd.values
+            # 1) dataframe‑âncora (uma linha por observação original)
+            base = (
+                df[[self.contract_col, "_date"]]
+                .assign(_idx=df.index)                           # <- row‑id p/ re‑agregar
+            )
+            base["_start"] = base["_date"] + DateOffset(months=1)   # t0 + 1
+            base["_end"]   = base["_date"] + DateOffset(months=horizon)
 
-            # 2) copia para df na posição correta
-            df.loc[df_rev.index, col_aux] = df_rev[col_aux]
-            # -------------------------------------------------------------------
+            # 2) dataframe‑futuro (todas as ocorrências de DPD)
+            fut = (
+                df[[self.contract_col, "_date", self.dpd_col]]
+                .rename(columns={"_date": "_f_date", self.dpd_col: "_f_dpd"})
+            )
 
-            for col_name, days_threshold in specs_for_horizon:
-                    df[col_name] = (df[f"_max_dpd_{horizon}m"] >= days_threshold).astype("int8")
+            # 3) produto cartesiano por contrato
+            joined = (
+                base.merge(fut, on=self.contract_col, how="left")
+                    .query("_f_date >= _start and _f_date <= _end")
+            )
+
+            # 4) máximo DPD dentro da janela, devolvido para a posição original
+            max_future = joined.groupby("_idx")["_f_dpd"].max()
+            df[col_aux] = (
+                max_future.reindex(df.index)            # alinha pelo row‑id
+                        .fillna(-np.inf)              # não houve atraso futuro
+            )
+
+            # 5) cria efetivamente cada target requerido p/ esse horizonte
+            for col_name, days_thr in specs_for_horizon:
+                df[col_name] = (df[col_aux] >= days_thr).astype("int8")
+
 
     def _calculate_over_targets(self, df: pd.DataFrame) -> None:
         for horizon, specs_for_horizon in self._over_specs_grouped.items():
