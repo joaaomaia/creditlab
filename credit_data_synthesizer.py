@@ -59,6 +59,16 @@ for i in range(5, 9):
     BASE_9x9[i, i - 1] = 0.35
     BASE_9x9[i, i] = 0.65
 
+# Fatores de Sazonalidade (Jan=1.05 ... Dez=0.90)
+# > 1.0: Mês mais arriscado (mais chance de entrar em atraso)
+# < 1.0: Mês menos arriscado (mais chance de ficar em dia)
+DEFAULT_SEASONALITY_FACTORS = [
+    1.05, 1.03, 1.0,  # Jan-Mar: Pós-ferias, impostos (pior)
+    0.98, 0.97, 0.98, # Abr-Jun: Meio de ano (melhora)
+    1.0,  1.0,  1.0,  # Jul-Set: Neutro
+    0.98, 0.95, 0.92, # Out-Dez: Bônus, 13º salário (melhor)
+]
+
 import warnings
 import logging
 warnings.simplefilter(action='ignore', category=pd.errors.SettingWithCopyWarning)
@@ -119,7 +129,7 @@ class GroupProfile:
         rng: np.random.Generator,
         *,
         id_offset: int = 0,
-        ids: np.ndarray | None = None,
+        ids: list[str] | None = None,  # Alterado para list[str]
         buckets: List[int] | None = None,
         start_safra: pd.Timestamp | None = None,
     ) -> pd.DataFrame:
@@ -129,9 +139,11 @@ class GroupProfile:
 
         # Identificadores
         if ids is None:
+            # Este trecho parece não ser usado, mas por segurança, mantemos
             df["id_contrato"] = id_offset + np.arange(n, dtype="int64")
         else:
-            df["id_contrato"] = np.asarray(ids, dtype="int64")
+            # Os IDs agora são strings, então não forçamos a conversão para int64
+            df["id_contrato"] = ids
         df["grupo_homogeneo"] = self.name
 
         if start_safra is None:
@@ -411,7 +423,7 @@ class CreditDataSynthesizer:
         buckets: List[int] | None = None,
         writeoff_bucket: int | None = None,
         base_matrix: np.ndarray | None = None,
-        force_event_rate: bool = True,
+        force_event_rate: bool = False,
         target_ratio: float = 0.10,
         sampler_kwargs: dict | None = None,
         n_clients: int | None = None,
@@ -432,6 +444,8 @@ class CreditDataSynthesizer:
         max_recompute_iter: int = 2,
         min_volume: int = 30,
         verbose: bool = False,
+        seasonality_factors: List[float] | None = None,
+        risk_memory_factor: float = 1.2,
     ) -> None:
         self.group_profiles = group_profiles
         self.contracts_per_group = contracts_per_group
@@ -445,6 +459,13 @@ class CreditDataSynthesizer:
         self.target_ratio = target_ratio
         self._sampler_kwargs = sampler_kwargs or {}
         self._sampler_kwargs.setdefault("tol_pp", tol_pp)
+        self.risk_memory_factor = risk_memory_factor
+        self.SEASONALITY_FACTORS = np.asarray(
+            seasonality_factors if seasonality_factors is not None else DEFAULT_SEASONALITY_FACTORS
+        )
+        if len(self.SEASONALITY_FACTORS) != 12:
+            raise ValueError("seasonality_factors deve conter exatamente 12 valores.")
+                
         n_groups = len(group_profiles)
         pd_vals = np.array([gp.pd_base for gp in group_profiles], dtype=float)
         if new_contract_rate is None:
@@ -457,6 +478,7 @@ class CreditDataSynthesizer:
         else:
             arr = np.asarray(closure_rate, dtype=float)
             self.closure_rate = np.full(n_groups, arr) if arr.ndim == 0 else arr
+
         self.jitter = jitter
         self.jitter_pct = jitter_pct
         self.jitter_min = jitter_min
@@ -473,6 +495,9 @@ class CreditDataSynthesizer:
         self.min_volume = min_volume
         self.verbose = verbose
         self.logger = logger.getChild(self.__class__.__name__)
+
+        self.macro_series = self._generate_macro_series(self.n_safras)
+
 
         for gp in self.group_profiles:
             if gp.transition_matrix is None or gp.transition_matrix.shape[0] != len(self.buckets):
@@ -547,66 +572,79 @@ class CreditDataSynthesizer:
         return df
 
     # ------------------------------------------------------------------
-    def _next_id(self) -> int:
-        """Return next unique contract ID."""
+    def _next_id(self) -> str:
+        """Return next unique contract ID as a formatted string."""
         nxt = next(self._id_pool)
-        if nxt >= 10 ** self.id_length:
-            raise RuntimeError("ID pool exhausted")
-        return nxt
+        # Usando f-string para preenchimento com zeros à esquerda com base no id_length
+        return f"{nxt:0{self.id_length}d}"
 
-    def _next_ids(self, n: int) -> np.ndarray:
-        """Return array with ``n`` new unique contract IDs."""
-        ids = np.fromiter((self._next_id() for _ in range(n)), dtype="int64", count=n)
-        return ids
+    def _next_ids(self, n: int) -> list[str]:
+        """Return a list with ``n`` new unique contract IDs."""
+        # Retorna uma lista de strings em vez de um array numpy
+        return [self._next_id() for _ in range(n)]
+
+    # Adicione um método para gerar a série
+    def _generate_macro_series(self, n_months: int) -> np.ndarray:
+        """Gera uma série temporal simples para simular um ciclo econômico."""
+        # Fator > 1: Economia aquecida (menor risco)
+        # Fator < 1: Recessão (maior risco)
+        x = np.linspace(0, 2 * np.pi, n_months)
+        # Um ciclo econômico completo ao longo do período
+        cycle = 1.2 - 0.4 * np.sin(x) 
+        noise = self.rng.normal(0, 0.05, n_months)
+        series = cycle + noise
+        return series.clip(0.5, 1.5)
 
     # ---------------------------------------------------------------------
     # API pública
     # ---------------------------------------------------------------------
+
     def generate(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """Gera snapshot inicial, painel evolutivo e rastro de renegociação.
+            """Gera um snapshot inicial e um painel de dados com a evolução da carteira.
 
-        Returns
-        -------
-        Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
-            DataFrames de snapshot, painel e trace, respectivamente.
-        """
+            Returns:
+                Uma tupla com o snapshot inicial, o painel completo e o rastro de
+                renegociações.
+            """
+            self._generate_snapshot()
+            self._log_rates("snapshot", self._snapshot)
+            self._generate_panel()
+            if self.force_event_rate:
+                tol_pp = self._sampler_kwargs.get("tol_pp", 0.5)
+                for k in range(self.max_recompute_iter):
+                    self._compute_targets()
+                    # lazy import to avoid hard dependency
+                    from credit_data_sampler import TargetSampler
 
-        self._generate_snapshot()
-        self._log_rates("snapshot", self._snapshot)
-        self._generate_panel()
-        tol_pp = self._sampler_kwargs.get("tol_pp", 0.5)
-        for k in range(self.max_recompute_iter):
-            self._compute_targets()
-            from credit_data_sampler import TargetSampler
+                    sampler = TargetSampler(
+                        target_ratio=self.target_ratio,
+                        strategy=self.sampler_strategy,
+                        **self._sampler_kwargs,
+                    )
+                    self._panel, overflow, info = sampler.fit_transform(
+                        self._panel,
+                        target_col="ever90m12",
+                        safra_col="safra",
+                        group_col="grupo_homogeneo",
+                        date_col="data_ref",
+                        contract_id_col="id_contrato",
+                        realloc_window=self.realloc_window,
+                    )
+                    self._reinject(overflow)
+                    panel_gr = self._panel.groupby("grupo_homogeneo")["ever90m12"]
+                    ratios = panel_gr.sum() / panel_gr.count()
+                    self._log_rates(f"recompute {k + 1}", self._panel)
+                    if ratios.max() < self.target_ratio * (1 + tol_pp):
+                        break
 
-            sampler = TargetSampler(
-                target_ratio=self.target_ratio,
-                strategy=self.sampler_strategy,
-                **self._sampler_kwargs,
-            )
-            self._panel, overflow, info = sampler.fit_transform(
-                self._panel,
-                target_col="ever90m12",
-                safra_col="safra",
-                group_col="grupo_homogeneo",
-                random_state=self.rng.integers(0, 1_000_000),
-                return_info=True,
-            )
-            self._log("recompute %d: max_pp=%.2f", k + 1, info["max_pp"])
-            if info.get("unmet_groups"):
-                self.logger.warning("unmet groups: %s", info["unmet_groups"])
-            if info["max_pp"] <= tol_pp and info["order_ok"]:
-                break
-            if not info.get("unmet_groups"):
-                break
-            self._reinject(overflow)
-        self._snapshot = (
-            self._panel[self._panel["data_ref"] == self._panel["data_ref"].min()] 
-            .copy()
-            .reset_index(drop=True)
-        )
-        self._log_rates("final", self._panel)
-        return self._snapshot, self._panel, self._trace
+            # --- SOLUÇÃO: ADICIONAR ESTA LINHA PARA GARANTIR A LIMPEZA FINAL ---
+            # Remove quaisquer duplicatas que possam ter sido geradas durante a simulação
+            self._panel.drop_duplicates(subset=['id_contrato', 'data_ref'], inplace=True, keep='first')
+            # --------------------------------------------------------------------
+
+            # A linha abaixo recria o snapshot a partir do painel JÁ LIMPO
+            self._snapshot = self._panel[self._panel["data_ref"] == self._panel["data_ref"].min()]
+            return self._snapshot, self._panel, self._trace
 
     # ------------------------------------------------------------------
     # Passo 1: snapshot
@@ -727,7 +765,7 @@ class CreditDataSynthesizer:
 
         for m in range(1, self.n_safras):
             ref_date = start_date + pd.DateOffset(months=m)
-            panel_month, current, stats = self._evolve_one_month(current, ref_date, traces)
+            panel_month, current, stats = self._evolve_one_month(current, ref_date, traces, m)
             records.append(panel_month.copy())
             closed_recs.append(panel_month[panel_month["data_fim_contrato"].notna()].copy())
             monthly_rate = panel_month["ever90m12"].mean() * 100
@@ -746,142 +784,199 @@ class CreditDataSynthesizer:
         self._trace = pd.DataFrame(traces, columns=["id_antigo", "id_novo", "data_evento"])
 
     # ------------------------------------------------------------------
+
     def _evolve_one_month(
-        self,
-        df: pd.DataFrame,
-        ref_date: pd.Timestamp,
-        trace_records: List[dict],
-    ) -> Tuple[pd.DataFrame, pd.DataFrame, dict]:
-        df = df.copy()
-        buckets = np.array(self.buckets, dtype=np.int16)
-        n_buckets = len(buckets)
-        stats = {gp.name: {"new": 0, "closed": 0, "defaults": 0} for gp in self.group_profiles}
-        df["age_months"] += 1
-        for gp in self.group_profiles:
-            mask = df["grupo_homogeneo"] == gp.name
-            if not mask.any():
-                continue
-            sub = df.loc[mask]
+            self,
+            df: pd.DataFrame,
+            ref_date: pd.Timestamp,
+            trace_records: List[dict],
+            m: int,
+        ) -> Tuple[pd.DataFrame, pd.DataFrame, dict]:
+            df = df.copy()
+            buckets = np.array(self.buckets, dtype=np.int16)
+            n_buckets = len(buckets)
+            stats = {gp.name: {"new": 0, "closed": 0, "defaults": 0} for gp in self.group_profiles}
+            df["age_months"] += 1
 
-            prev_delay = sub["dias_atraso"].to_numpy()
-            delay_idx = np.array([bucket_index(d, list(buckets)) for d in prev_delay], dtype=np.int16)
-            mat = gp.transition_matrix
-            new_idx = np.fromiter(
-                (self.rng.choice(n_buckets, p=mat[i]) for i in delay_idx), dtype=np.int16
-            )
-            new_delay = buckets[new_idx]
+            # --- Fatores Globais do Mês ---
+            macro_shock_factor = self.macro_series[m]
+            month_index = ref_date.month - 1
+            seasonal_factor = self.SEASONALITY_FACTORS[month_index]
 
-            # triggers
-            prev_streak90 = sub["streak_90"].to_numpy()
-            delay_buckets = np.array([bucket_index(d, list(buckets)) for d in new_delay], dtype=np.int16)
-            bucket_factor = np.where(
-                delay_buckets == 0,
-                0.1,
-                np.where(delay_buckets == 1, 0.3, np.where(delay_buckets == 2, 0.6, 1.0)),
-            )
-            trigger1_prob = gp.reneg_prob_exog * bucket_factor
-            trigger1 = self.rng.random(len(sub)) < trigger1_prob
-            streak_90 = np.where(new_delay == 90, prev_streak90 + 1, 0)
-            trigger2 = (streak_90 >= 3) & (new_delay == 90)
-            reneg_mask = trigger1 | trigger2
-            stats[gp.name]["defaults"] = int((new_delay >= 90).sum())
+            for gp in self.group_profiles:
+                mask = df["grupo_homogeneo"] == gp.name
+                if not mask.any():
+                    continue
+                sub = df.loc[mask].copy()
 
-            # atualiza atraso e contadores
-            sub["dias_atraso"] = new_delay
-            sub["streak_90"] = streak_90
-            if self.writeoff_bucket is not None:
-                sub.loc[new_delay >= self.writeoff_bucket, "write_off"] = 1
+                # --- GERAÇÃO DAS MATRIZES DINÂMICAS (NORMAL E DE RISCO) ---
+                base_sev = (gp.pd_base - 0.02) / (0.12 - 0.02)
+                current_sev = (base_sev / macro_shock_factor).clip(0, 5)
 
-            # pagamentos e contagem consecutiva
-            on_time = new_delay == 0
-            sub.loc[on_time, "saldo_devedor"] = (
-                sub.loc[on_time, "saldo_devedor"] - sub.loc[on_time, "valor_parcela"]
-            ).clip(lower=0)
-            sub.loc[on_time, "num_parcelas_pagas"] += 1
-            sub.loc[on_time, "data_ult_pgt"] = ref_date
-            sub.loc[on_time, "num_parcelas_pagas_consecutivas"] += 1
-            sub.loc[~on_time, "num_parcelas_pagas_consecutivas"] = 0
-
-            # Refinanciamento
-            elig = on_time & (sub["num_parcelas_pagas_consecutivas"] >= 4)
-            accept = self.rng.random(len(sub)) < gp.p_accept_refin
-            refin_mask = elig & accept
-            sub.loc[refin_mask, "nivel_refinanciamento"] += 1
-            sub.loc[refin_mask, "saldo_devedor"] *= 1.1
-            sub.loc[refin_mask, "num_parcelas_pagas_consecutivas"] = 0
-
-            # Renegociação
-            for idx in sub.index[reneg_mask]:
-                old_id = int(sub.at[idx, "id_contrato"])
-                new_id = int(self._next_id())
-                trace_records.append(
-                    {"id_antigo": old_id, "id_novo": new_id, "data_evento": ref_date}
+                # 1. Matriz Base (para clientes normais e já em atraso)
+                mat_base = generate_transition_matrix(
+                    self.buckets, current_sev, base_mat=self.base_matrix
                 )
-                sub.at[idx, "id_contrato"] = new_id
-                sub.at[idx, "nivel_refinanciamento"] = 0
-                sub.at[idx, "dias_atraso"] = 0
-                sub.at[idx, "streak_90"] = 0
-                sub.at[idx, "safra"] = ref_date.strftime("%Y%m")
-                sub.at[idx, "num_parcelas_pagas"] = 0
-                sub.at[idx, "data_ult_pgt"] = ref_date
-                sub.at[idx, "num_parcelas_pagas_consecutivas"] = 0
-                sub.at[idx, "qtd_renegociacoes"] += 1
+                mat_base = mat_base.copy()
+                stay_prob = mat_base[0, 0]
+                mat_base[0, 0] = (stay_prob / seasonal_factor).clip(0.01, 0.99)
+                if mat_base[0, 1:].sum() > 0:
+                    mat_base[0, 1:] = mat_base[0, 1:] / mat_base[0, 1:].sum() * (1 - mat_base[0, 0])
+                else:
+                    mat_base[0, 0] = 1.0
 
-            noise_arr = np.zeros(len(sub), dtype=int)
-            df.loc[mask] = sub
+                # 2. Matriz de Risco (para clientes em dia com memória de inadimplência)
+                risky_sev = (current_sev * self.risk_memory_factor).clip(0, 5)
+                mat_risky = generate_transition_matrix(
+                    self.buckets, risky_sev, base_mat=self.base_matrix
+                )
+                mat_risky = mat_risky.copy()
+                stay_prob_risky = mat_risky[0, 0]
+                mat_risky[0, 0] = (stay_prob_risky / seasonal_factor).clip(0.01, 0.99)
+                if mat_risky[0, 1:].sum() > 0:
+                    mat_risky[0, 1:] = mat_risky[0, 1:] / mat_risky[0, 1:].sum() * (1 - mat_risky[0, 0])
+                else:
+                    mat_risky[0, 0] = 1.0
+                
+                # --- TRANSIÇÃO DE ESTADO COM MEMÓRIA DE INADIMPLÊNCIA ---
+                new_delay = np.zeros(len(sub), dtype=np.int16)
 
-        rates_close = {gp.name: rate for gp, rate in zip(self.group_profiles, self.closure_rate)}
-        close_mask = np.zeros(len(df), dtype=bool)
-        for gp in self.group_profiles:
-            mask = df["grupo_homogeneo"] == gp.name
-            prob = rates_close[gp.name]
-            rand = self.rng.random(mask.sum())
-            base = (df.loc[mask, "age_months"] >= df.loc[mask, "duration_m"]).to_numpy()
-            close_mask[mask] = base | (rand < prob)
-        df.loc[close_mask, "data_fim_contrato"] = ref_date
-        open_df = df[~close_mask].copy()
-        closed_ids = set(df.loc[close_mask, "id_cliente"].astype(int))
-        for gp in self.group_profiles:
-            mask = df["grupo_homogeneo"] == gp.name
-            stats[gp.name]["closed"] = int(close_mask[mask].sum())
+                # Subgrupo 1: Clientes já em atraso (usam matriz base)
+                mask_delinquent = sub["dias_atraso"] > 0
+                if mask_delinquent.any():
+                    prev_delay_d = sub.loc[mask_delinquent, "dias_atraso"].to_numpy()
+                    delay_idx_d = np.array([bucket_index(d, list(buckets)) for d in prev_delay_d], dtype=np.int16)
+                    new_idx_d = np.fromiter((self.rng.choice(n_buckets, p=mat_base[i]) for i in delay_idx_d), dtype=np.int16)
+                    new_delay[mask_delinquent.to_numpy()] = buckets[new_idx_d]
 
-        # spawn new contracts -------------------------------------------------
-        new_list = []
-        for idx_gp, gp in enumerate(self.group_profiles):
-            vivos = (open_df["grupo_homogeneo"] == gp.name).sum()
-            if vivos < self.min_volume:
-                continue
-            rate_new = self.new_contract_rate[idx_gp]
-            n_new = int(round(rate_new * max(vivos, 1)))
-            if vivos == 0:
-                n_new = max(n_new, 1)
-            if n_new > 0:
-                active = set(open_df["id_cliente"].astype(int)).union(closed_ids)
-                new_df = self._spawn_new_contracts(gp, n_new, ref_date, active)
-                new_list.append(new_df)
-                stats[gp.name]["new"] = len(new_df)
-        if new_list:
-            open_df = pd.concat([open_df] + new_list, ignore_index=True)
+                # Subgrupo 2 e 3: Clientes em dia (dias_atraso == 0)
+                mask_current = sub["dias_atraso"] == 0
+                if mask_current.any():
+                    sub_current = sub[mask_current]
+                    mask_risky_memory = sub_current["ever90m12"] == 1
+                    
+                    # Subgrupo 2: Em dia COM memória de risco (usam matriz de risco)
+                    if mask_risky_memory.any():
+                        n_risky = mask_risky_memory.sum()
+                        new_idx_r = self.rng.choice(n_buckets, size=n_risky, p=mat_risky[0])
+                        indices_risky = mask_current.to_numpy().nonzero()[0][mask_risky_memory.to_numpy()]
+                        new_delay[indices_risky] = buckets[new_idx_r]
 
-        panel_df = pd.concat([open_df, df[close_mask]], ignore_index=True)
-        panel_df["data_ref"] = ref_date
-        panel_df["safra"] = ref_date.strftime("%Y%m")
-        open_df["data_ref"] = ref_date
-        open_df["safra"] = ref_date.strftime("%Y%m")
-        for gp in self.group_profiles:
-            mask = panel_df["grupo_homogeneo"] == gp.name
-            size = mask.sum()
-            defaults = stats[gp.name]["defaults"]
-            bad = defaults / size * 100 if size > 0 else 0.0
-            self._log(
-                "%s GH=%s new=%d closed=%d bad=%.2f%%",
-                ref_date.strftime("%Y-%m"),
-                gp.name,
-                stats[gp.name]["new"],
-                stats[gp.name]["closed"],
-                bad,
-            )
-        return panel_df, open_df, stats
+                    # Subgrupo 3: Em dia SEM memória de risco (usam matriz base)
+                    mask_normal_memory = ~mask_risky_memory
+                    if mask_normal_memory.any():
+                        n_normal = mask_normal_memory.sum()
+                        new_idx_n = self.rng.choice(n_buckets, size=n_normal, p=mat_base[0])
+                        indices_normal = mask_current.to_numpy().nonzero()[0][mask_normal_memory.to_numpy()]
+                        new_delay[indices_normal] = buckets[new_idx_n]
+
+                # --- ATUALIZAÇÃO DE FLAGS E DADOS ---
+                sub["dias_atraso"] = new_delay
+                sub.loc[new_delay >= 90, 'ever90m12'] = 1
+
+                # --- Lógica de Triggers de Renegociação Dinâmica ---
+                prev_streak90 = sub["streak_90"].to_numpy()
+                delay_buckets = np.array([bucket_index(d, list(buckets)) for d in new_delay], dtype=np.int16)
+                bucket_factor = np.where(delay_buckets == 0, 0.1, np.where(delay_buckets == 1, 0.3, np.where(delay_buckets == 2, 0.6, 1.0)))
+                reneg_count = sub["qtd_renegociacoes"].to_numpy()
+                reneg_fatigue_factor = np.exp(-0.5 * reneg_count) 
+                trigger1_prob = gp.reneg_prob_exog * bucket_factor * reneg_fatigue_factor
+                trigger1 = self.rng.random(len(sub)) < trigger1_prob
+                streak_90 = np.where(new_delay == 90, prev_streak90 + 1, 0)
+                trigger2 = (streak_90 >= 3) & (new_delay == 90)
+                reneg_mask = trigger1 | trigger2
+                stats[gp.name]["defaults"] = int((new_delay >= 90).sum())
+
+                # atualiza contadores
+                sub["streak_90"] = streak_90
+                if self.writeoff_bucket is not None:
+                    sub.loc[new_delay >= self.writeoff_bucket, "write_off"] = 1
+
+                # pagamentos e contagem consecutiva
+                on_time = new_delay == 0
+                sub.loc[on_time, "saldo_devedor"] = (sub.loc[on_time, "saldo_devedor"] - sub.loc[on_time, "valor_parcela"]).clip(lower=0)
+                sub.loc[on_time, "num_parcelas_pagas"] += 1
+                sub.loc[on_time, "data_ult_pgt"] = ref_date
+                sub.loc[on_time, "num_parcelas_pagas_consecutivas"] += 1
+                sub.loc[~on_time, "num_parcelas_pagas_consecutivas"] = 0
+
+                # --- Lógica de Refinanciamento Dinâmico ---
+                elig = on_time & (sub["num_parcelas_pagas_consecutivas"] >= 4)
+                score_latente = sub["score_latente"].to_numpy()
+                p_accept = (gp.p_accept_refin * (1 + score_latente * 0.1)).clip(0.1, 0.9)
+                accept = self.rng.random(len(sub)) < p_accept
+                refin_mask = elig & accept
+                sub.loc[refin_mask, "nivel_refinanciamento"] += 1
+                sub.loc[refin_mask, "saldo_devedor"] *= 1.1
+                sub.loc[refin_mask, "num_parcelas_pagas_consecutivas"] = 0
+
+                # --- Renegociação (com IDs como STRING) ---
+                for idx in sub.index[reneg_mask]:
+                    old_id = sub.at[idx, "id_contrato"]
+                    new_id = self._next_id()
+                    trace_records.append({"id_antigo": old_id, "id_novo": new_id, "data_evento": ref_date})
+                    sub.at[idx, "id_contrato"] = new_id
+                    sub.at[idx, "nivel_refinanciamento"] = 0
+                    sub.at[idx, "dias_atraso"] = 0
+                    sub.at[idx, "streak_90"] = 0
+                    sub.at[idx, "safra"] = ref_date.strftime("%Y%m")
+                    sub.at[idx, "num_parcelas_pagas"] = 0
+                    sub.at[idx, "data_ult_pgt"] = ref_date
+                    sub.at[idx, "num_parcelas_pagas_consecutivas"] = 0
+                    sub.at[idx, "qtd_renegociacoes"] += 1
+                    sub.at[idx, "ever90m12"] = 0 # Zera a memória para o novo contrato
+
+                df.loc[mask] = sub
+
+            # --- O RESTO DA FUNÇÃO (FECHAMENTO E NOVOS CONTRATOS) CONTINUA COMO ANTES ---
+            rates_close = {gp.name: rate for gp, rate in zip(self.group_profiles, self.closure_rate)}
+            close_mask = np.zeros(len(df), dtype=bool)
+            for gp in self.group_profiles:
+                mask = df["grupo_homogeneo"] == gp.name
+                if not mask.any(): continue
+                prob = rates_close[gp.name]
+                rand = self.rng.random(mask.sum())
+                base = (df.loc[mask, "age_months"] >= df.loc[mask, "duration_m"]).to_numpy()
+                close_mask[mask] = base | (rand < prob)
+            df.loc[close_mask, "data_fim_contrato"] = ref_date
+            open_df = df[~close_mask].copy()
+            closed_ids = set(df.loc[close_mask, "id_cliente"].astype(int))
+            for gp in self.group_profiles:
+                mask = df["grupo_homogeneo"] == gp.name
+                stats[gp.name]["closed"] = int(close_mask[mask].sum())
+
+            new_list = []
+            for idx_gp, gp in enumerate(self.group_profiles):
+                vivos = (open_df["grupo_homogeneo"] == gp.name).sum()
+                if vivos < self.min_volume: continue
+                rate_new = self.new_contract_rate[idx_gp] * macro_shock_factor
+                n_new = int(round(rate_new * max(vivos, 1)))
+                if vivos == 0: n_new = max(n_new, 1)
+                if n_new > 0:
+                    active = set(open_df["id_cliente"].astype(int)).union(closed_ids)
+                    new_df = self._spawn_new_contracts(gp, n_new, ref_date, active)
+                    new_list.append(new_df)
+                    stats[gp.name]["new"] = len(new_df)
+            if new_list:
+                open_df = pd.concat([open_df] + new_list, ignore_index=True)
+
+            panel_df = pd.concat([open_df, df[close_mask]], ignore_index=True)
+            panel_df["data_ref"] = ref_date
+            # A safra não deve ser atualizada para contratos existentes
+            # panel_df["safra"] = ref_date.strftime("%Y%m") 
+            open_df["data_ref"] = ref_date
+            for gp in self.group_profiles:
+                mask = panel_df["grupo_homogeneo"] == gp.name
+                size = mask.sum()
+                defaults = stats[gp.name]["defaults"]
+                bad = defaults / size * 100 if size > 0 else 0.0
+                self._log(
+                    "%s GH=%s new=%d closed=%d bad=%.2f%%",
+                    ref_date.strftime("%Y-%m"), gp.name, stats[gp.name]["new"],
+                    stats[gp.name]["closed"], bad,
+                )
+            return panel_df, open_df, stats
+
 
     def _spawn_new_contracts(
         self, gp: GroupProfile, n: int, ref_date: pd.Timestamp, active_ids: set[int]
